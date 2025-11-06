@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RSS File Parser</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>RSS File Parser</h1>
+            <p>Fetch and organize RSS feed files by brand</p>
+        </header>
+        
+        <main>
+            <div class="input-section">
+                <div class="url-input-group">
+                    <input type="url" id="rss-url" placeholder="Enter RSS feed URL" value="https://api.nzbgeek.info/rss?t=6000&limit=1000&dl=1&r=REDACTED">
+                    <button id="fetch-btn" class="btn btn-primary">Fetch RSS</button>
+                </div>
+                
+                <div class="time-filter-section">
+                    <label for="time-filter">Show files from last:</label>
+                    <select id="time-filter">
+                        <option value="0">All time</option>
+                        <option value="1">1 hour</option>
+                        <option value="2">2 hours</option>
+                        <option value="3">3 hours</option>
+                        <option value="4">4 hours</option>
+                        <option value="6">6 hours</option>
+                        <option value="8">8 hours</option>
+                        <option value="12">12 hours</option>
+                        <option value="24">24 hours</option>
+                        <option value="48">48 hours</option>
+                        <option value="72">72 hours</option>
+                        <option value="168">1 week</option>
+                        <option value="336">2 weeks</option>
+                        <option value="720">1 month</option>
+                    </select>
+                    <span class="filter-info" id="filter-info">Showing all files</span>
+                </div>
+                
+                <div class="button-group">
+                    <button id="clear-btn" class="btn btn-secondary">Clear</button>
+                    <button id="load-sample-btn" class="btn btn-secondary">Load Sample</button>
+                </div>
+            </div>
+            
+            <div class="tabs-container">
+                <div class="tabs-header">
+                    <button class="tab-btn active" data-tab="results">Results</button>
+                    <button class="tab-btn" data-tab="favorites">Favorites</button>
+                    <button class="tab-btn" data-tab="management">Favorites & Keywords</button>
+                    <button class="tab-btn" data-tab="excluded">Excluded Files</button>
+                </div>
+                
+                <div class="tab-content active" id="results-tab">
+                    <div class="results-section" id="results-section" style="display: none;">
+                        <div class="stats">
+                            <div class="stats-row">
+                                <span id="total-files">0</span> files found across <span id="total-brands">0</span> brands
+                                <span id="excluded-count" style="margin-left: 15px; color: #dc3545;">(<span id="excluded-files-count">0</span> excluded)</span>
+                            </div>
+                            <div class="stats-row">
+                                <span class="latest-upload">Latest upload: <span id="latest-upload-date">None</span></span>
+                                <span class="filter-status" id="filter-status"></span>
+                            </div>
+                        </div>
+                        
+                        <div class="search-section">
+                            <input type="text" id="results-search" placeholder="Search files by name..." class="search-input">
+                            <span class="search-status" id="search-status"></span>
+                        </div>
+                        
+                        <div class="brands-container" id="brands-container">
+                            <!-- Brands will be populated here -->
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="tab-content" id="favorites-tab">
+                    <div class="favorites-display-section">
+                        <div class="favorites-header">
+                            <h3>Your Favorites</h3>
+                            <p>Showing favorite brands and files matching your keywords</p>
+                        </div>
+                        
+                                                    <div class="favorites-stats">
+                                <div class="stat-item">
+                                    <span class="stat-label">Favorite Brands:</span>
+                                    <span class="stat-value" id="favorite-brands-count">0</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span class="stat-label">Keyword Matches:</span>
+                                    <span class="stat-value" id="keyword-matches-count">0</span>
+                                </div>
+                                <div class="stat-item">
+                                    <span class="stat-label">Latest Upload:</span>
+                                    <span class="stat-value" id="favorites-latest-upload">None</span>
+                                </div>
+                            </div>
+                        
+                        <div class="favorites-content-full">
+                            <div class="favorites-section-full">
+                                <h4>Favorite Brands</h4>
+                                <div class="favorite-brands-display" id="favorite-brands-display">
+                                    <!-- Favorite brands will be populated here -->
+                                </div>
+                            </div>
+                            
+                            <div class="favorites-section-full">
+                                <h4>Keyword Matches</h4>
+                                <div class="keyword-matches-display" id="keyword-matches-display">
+                                    <!-- Keyword matches will be populated here -->
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="tab-content" id="management-tab">
+                    <div class="favorites-section">
+                        <div class="favorites-header">
+                            <h3>Favorites & Keywords Management</h3>
+                            <p>Manage your favorite brands and keywords for highlighting and excluding files</p>
+                        </div>
+                        
+                        <div class="favorites-content">
+                            <div class="favorites-column">
+                                <h4>Favorite Brands</h4>
+                                <div class="favorites-list" id="favorite-brands-list">
+                                    <!-- Favorite brands will be populated here -->
+                                </div>
+                                <div class="add-favorite-form">
+                                    <input type="text" id="add-brand-input" placeholder="Enter brand name">
+                                    <button id="add-brand-btn" class="btn btn-primary">Add Brand</button>
+                                </div>
+                            </div>
+                            
+                            <div class="favorites-column">
+                                <h4>Highlight Keywords</h4>
+                                <div class="keywords-list" id="keywords-list">
+                                    <!-- Keywords will be populated here -->
+                                </div>
+                                <div class="add-keyword-form">
+                                    <input type="text" id="add-keyword-input" placeholder="Enter keyword">
+                                    <button id="add-keyword-btn" class="btn btn-primary">Add Keyword</button>
+                                </div>
+                            </div>
+                            
+                            <div class="favorites-column">
+                                <h4>Exclude Keywords</h4>
+                                <div class="exclude-keywords-list" id="exclude-keywords-list">
+                                    <!-- Exclude keywords will be populated here -->
+                                </div>
+                                <div class="add-exclude-keyword-form">
+                                    <input type="text" id="add-exclude-keyword-input" placeholder="Enter keyword to exclude">
+                                    <button id="add-exclude-keyword-btn" class="btn btn-danger">Add Exclude</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="tab-content" id="excluded-tab">
+                    <div class="excluded-section">
+                        <div class="excluded-header">
+                            <h3>Excluded Files</h3>
+                            <p>Review files that have been excluded based on your exclude keywords</p>
+                        </div>
+                        
+                        <div class="excluded-stats">
+                            <span id="excluded-total-count">0</span> files excluded
+                        </div>
+                        
+                        <div class="excluded-filters">
+                            <label for="excluded-brand-filter">Filter by brand:</label>
+                            <select id="excluded-brand-filter">
+                                <option value="">All brands</option>
+                            </select>
+                            
+                            <label for="excluded-keyword-filter">Filter by exclude keyword:</label>
+                            <select id="excluded-keyword-filter">
+                                <option value="">All keywords</option>
+                            </select>
+                        </div>
+                        
+                        <div class="excluded-files-container" id="excluded-files-container">
+                            <!-- Excluded files will be populated here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <script src="script.js"></script>
+</body>
+</html>
