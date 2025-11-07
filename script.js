@@ -362,13 +362,15 @@ class RSSParser {
         try {
             const titleElement = item.querySelector('title');
             const linkElement = item.querySelector('link');
+            const enclosureElement = item.querySelector('enclosure');
             const pubDateElement = item.querySelector('pubDate');
             const descElement = item.querySelector('description');
             
             if (!titleElement) return null;
             
             const title = titleElement.textContent || '';
-            const link = linkElement ? linkElement.textContent : '';
+            // Use enclosure URL if available (actual NZB download), otherwise fall back to link
+            const link = enclosureElement ? enclosureElement.getAttribute('url') : (linkElement ? linkElement.textContent : '');
             const pubDate = pubDateElement ? new Date(pubDateElement.textContent) : new Date();
             
             // Extract size - try newznab:attr first, then fall back to description
@@ -687,7 +689,7 @@ class RSSParser {
                                 <span class="file-age">${file.timeAgo}</span>
                 </div>
             </div>
-                        <a href="${proxyDownloadUrl}" class="download-btn" target="_blank">Download NZB</a>
+                        <a href="${proxyDownloadUrl}" class="download-btn">Download NZB</a>
             </div>
         `;
             });
@@ -1239,7 +1241,7 @@ class RSSParser {
                             <span class="matched-keywords">Keywords: ${file.matchedKeywords.join(', ')}</span>
                         </div>
                     </div>
-                    <a href="${proxyDownloadUrl}" class="download-btn" target="_blank">Download NZB</a>
+                    <a href="${proxyDownloadUrl}" class="download-btn">Download NZB</a>
                 </div>
             `;
         });
@@ -1342,7 +1344,7 @@ class RSSParser {
                             <span class="file-age">${file.timeAgo}</span>
                         </div>
                     </div>
-                    <a href="${proxyDownloadUrl}" class="download-btn" target="_blank">Download NZB</a>
+                    <a href="${proxyDownloadUrl}" class="download-btn">Download NZB</a>
                 </div>
             `;
         });

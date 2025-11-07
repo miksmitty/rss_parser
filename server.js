@@ -2,6 +2,9 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const path = require('path');
+const https = require('https');
+const http = require('http');
+const { URL } = require('url');
 
 const app = express();
 const PORT = 3000;
@@ -50,67 +53,110 @@ app.get('/proxy/rss', async (req, res) => {
     }
 });
 
-// Proxy endpoint for file downloads
-app.get('/proxy/download', async (req, res) => {
+// Proxy endpoint for file downloads using native Node.js HTTP/HTTPS with redirect support
+app.get('/proxy/download', (req, res) => {
     const { url, filename } = req.query;
     
     console.log('=== DOWNLOAD PROXY REQUEST ===');
     console.log('URL parameter:', url);
     console.log('Filename parameter:', filename);
-    console.log('Full query string:', req.url);
     
     if (!url) {
         console.log('Error: No URL provided');
         return res.status(400).json({ error: 'URL parameter is required' });
     }
     
-    try {
-        console.log('Attempting to fetch file from:', url);
-        const response = await fetch(url);
-        console.log('Fetch response status:', response.status);
-        console.log('Fetch response statusText:', response.statusText);
-        console.log('Fetch response headers:', Object.fromEntries(response.headers.entries()));
-        
-        if (!response.ok) {
-            console.log('HTTP error:', response.status, response.statusText);
-            const errorBody = await response.text();
-            console.log('Error response body:', errorBody);
-            return res.status(response.status).json({ 
-                error: `HTTP error: ${response.status} ${response.statusText}`,
-                details: errorBody
+    const finalFilename = filename || 'download';
+    let redirectCount = 0;
+    const maxRedirects = 5;
+    
+    function makeRequest(currentUrl) {
+        try {
+            const parsedUrl = new URL(currentUrl);
+            
+            console.log('Downloading from:', parsedUrl.href);
+            console.log('Redirect count:', redirectCount);
+            
+            // Choose http or https based on protocol
+            const client = parsedUrl.protocol === 'https:' ? https : http;
+            
+            // Request options with proper headers
+            const options = {
+                hostname: parsedUrl.hostname,
+                port: parsedUrl.port,
+                path: parsedUrl.pathname + parsedUrl.search,
+                method: 'GET',
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                }
+            };
+            
+            // Make the request
+            const request = client.get(options, (response) => {
+                console.log('Response status:', response.statusCode);
+                console.log('Response headers:', response.headers);
+                
+                // Handle redirects (301, 302, 303, 307, 308)
+                if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                    if (redirectCount >= maxRedirects) {
+                        console.log('Too many redirects');
+                        return res.status(500).json({ error: 'Too many redirects' });
+                    }
+                    
+                    redirectCount++;
+                    const redirectUrl = new URL(response.headers.location, currentUrl).href;
+                    console.log('Following redirect to:', redirectUrl);
+                    return makeRequest(redirectUrl);
+                }
+                
+                if (response.statusCode !== 200) {
+                    console.log('HTTP error:', response.statusCode);
+                    return res.status(response.statusCode).json({ 
+                        error: `HTTP error: ${response.statusCode}` 
+                    });
+                }
+                
+                // Set response headers BEFORE piping
+                res.set('Content-Type', 'application/octet-stream');
+                res.set('Content-Disposition', `attachment; filename="${finalFilename}"`);
+                
+                if (response.headers['content-length']) {
+                    res.set('Content-Length', response.headers['content-length']);
+                }
+                
+                console.log('Piping response directly to client...');
+                
+                // Pipe directly - pure passthrough, no processing
+                response.pipe(res);
+                
+                response.on('end', () => {
+                    console.log('Successfully piped file to client');
+                    console.log('=== DOWNLOAD PROXY COMPLETE ===');
+                });
+                
+                response.on('error', (err) => {
+                    console.error('Response stream error:', err);
+                });
             });
+            
+            request.on('error', (err) => {
+                console.error('Request error:', err);
+                if (!res.headersSent) {
+                    res.status(500).json({ error: `Failed to download file: ${err.message}` });
+                }
+            });
+            
+        } catch (error) {
+            console.error('=== DOWNLOAD PROXY ERROR ===');
+            console.error('Error message:', error.message);
+            console.error('Error stack:', error.stack);
+            if (!res.headersSent) {
+                res.status(500).json({ error: `Failed to download file: ${error.message}` });
+            }
         }
-        
-        // Get the content as a buffer
-        const buffer = await response.buffer();
-        console.log('File downloaded successfully, size:', buffer.length, 'bytes');
-        
-        // Set headers for file download
-        const contentType = response.headers.get('content-type') || 'application/octet-stream';
-        const finalFilename = filename || 'download';
-        
-        console.log('Setting Content-Type:', contentType);
-        console.log('Setting filename (raw):', finalFilename);
-        console.log('Filename length:', finalFilename.length);
-        console.log('Filename includes extension:', finalFilename.includes('.'));
-        
-        // Use RFC 5987 encoding for filename with special characters
-        const encodedFilename = encodeURIComponent(finalFilename);
-        console.log('Setting filename (encoded):', encodedFilename);
-        
-        res.set('Content-Type', contentType);
-        res.set('Content-Disposition', `attachment; filename="${finalFilename}"; filename*=UTF-8''${encodedFilename}`);
-        res.set('Content-Length', buffer.length);
-        
-        res.send(buffer);
-        console.log('Successfully sent file to client');
-        console.log('=== DOWNLOAD PROXY COMPLETE ===');
-    } catch (error) {
-        console.error('=== DOWNLOAD PROXY ERROR ===');
-        console.error('Error message:', error.message);
-        console.error('Error stack:', error.stack);
-        res.status(500).json({ error: `Failed to download file: ${error.message}` });
     }
+    
+    makeRequest(url);
 });
 
 app.listen(PORT, () => {
