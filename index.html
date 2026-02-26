@@ -16,7 +16,19 @@
         <main>
             <div class="input-section">
                 <div class="url-input-group">
-                    <input type="url" id="rss-url" placeholder="Enter RSS feed URL" value="https://api.nzbgeek.info/rss?t=6000&limit=1000&dl=1&r=REDACTED">
+                    <div class="url-dropdown-wrapper">
+                        <input type="url" id="rss-url" placeholder="Enter RSS feed URL" autocomplete="off">
+                        <button type="button" id="url-dropdown-btn" class="url-dropdown-toggle" title="Show URL history">▼</button>
+                        <div id="url-history-dropdown" class="url-history-dropdown">
+                            <div class="url-history-header">
+                                <span>Recent URLs</span>
+                                <button type="button" id="clear-url-history" class="clear-history-btn" title="Clear history">Clear</button>
+                            </div>
+                            <ul id="url-history-list" class="url-history-list">
+                                <!-- URL history items will be populated here -->
+                            </ul>
+                        </div>
+                    </div>
                     <button id="fetch-btn" class="btn btn-primary">Fetch RSS</button>
                 </div>
                 

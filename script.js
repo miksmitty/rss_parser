@@ -15,12 +15,18 @@ class RSSParser {
         this.antiFavoriteBrands = this.loadArray('rssParserAntiFavoriteBrands'); 
         this.keywords = this.loadArray('rssParserKeywords');
         this.excludeKeywords = this.loadArray('rssParserExcludeKeywords');
+        this.downloadedFiles = this.loadDownloadedFiles();
+        this.ignoredFiles = this.loadIgnoredFiles();
+        this.urlHistory = this.loadArray('rssParserUrlHistory');
         
-        // Load default RSS URL
+        // Load default RSS URL (most recent from history or saved default)
         const savedUrl = localStorage.getItem('rssParserDefaultUrl');
         if (savedUrl) {
             const urlInput = document.getElementById('rss-url');
             if (urlInput) urlInput.value = savedUrl;
+        } else if (this.urlHistory.length > 0) {
+            const urlInput = document.getElementById('rss-url');
+            if (urlInput) urlInput.value = this.urlHistory[0];
         }
         
         // Initialize UI
@@ -29,6 +35,7 @@ class RSSParser {
         this.initializeTimeFilter();
         this.initializeKeywordManagement();
         this.initializeSearchFilter();
+        this.initializeUrlHistoryDropdown();
         
         // Display saved favorites and keywords
         setTimeout(() => {
@@ -58,6 +65,181 @@ class RSSParser {
             localStorage.setItem(key, JSON.stringify(Array.isArray(array) ? array : []));
         } catch (error) {
             console.error(`Error saving ${key}:`, error);
+        }
+    }
+    
+    loadDownloadedFiles() {
+        try {
+            const saved = localStorage.getItem('rssParserDownloadedFiles');
+            const parsed = saved ? JSON.parse(saved) : {};
+            return typeof parsed === 'object' && parsed !== null ? parsed : {};
+        } catch (error) {
+            console.error('Error loading downloaded files:', error);
+            return {};
+        }
+    }
+    
+    saveDownloadedFiles() {
+        try {
+            localStorage.setItem('rssParserDownloadedFiles', JSON.stringify(this.downloadedFiles));
+        } catch (error) {
+            console.error('Error saving downloaded files:', error);
+        }
+    }
+    
+    loadIgnoredFiles() {
+        try {
+            const saved = localStorage.getItem('rssParserIgnoredFiles');
+            const parsed = saved ? JSON.parse(saved) : {};
+            return typeof parsed === 'object' && parsed !== null ? parsed : {};
+        } catch (error) {
+            console.error('Error loading ignored files:', error);
+            return {};
+        }
+    }
+    
+    saveIgnoredFiles() {
+        try {
+            localStorage.setItem('rssParserIgnoredFiles', JSON.stringify(this.ignoredFiles));
+        } catch (error) {
+            console.error('Error saving ignored files:', error);
+        }
+    }
+    
+    markFileAsIgnored(fileLink, fileName) {
+        const fileId = this.getFileId(fileLink);
+        const baseName = this.extractBaseName(fileName);
+        this.ignoredFiles[fileId] = {
+            fileName: fileName,
+            baseName: baseName,
+            ignoredAt: new Date().toISOString()
+        };
+        this.saveIgnoredFiles();
+        console.log('Marked file as ignored:', fileName, 'baseName:', baseName);
+    }
+    
+    unignoreFile(fileLink) {
+        const fileId = this.getFileId(fileLink);
+        if (this.ignoredFiles.hasOwnProperty(fileId)) {
+            delete this.ignoredFiles[fileId];
+            this.saveIgnoredFiles();
+            console.log('Unignored file:', fileLink);
+        }
+    }
+    
+    isFileIgnored(fileLink) {
+        const fileId = this.getFileId(fileLink);
+        return this.ignoredFiles.hasOwnProperty(fileId);
+    }
+    
+    hasSiblingIgnored(baseName) {
+        // Check if any file with the same baseName has been ignored
+        const groupKey = this.getBaseNameGroupKey(baseName);
+        for (const fileId in this.ignoredFiles) {
+            const ignoredFile = this.ignoredFiles[fileId];
+            const storedBaseName = ignoredFile.baseName || 
+                (ignoredFile.fileName ? this.extractBaseName(ignoredFile.fileName) : null);
+            if (storedBaseName != null && this.getBaseNameGroupKey(storedBaseName) === groupKey) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    markFileAsDownloaded(fileLink, fileName) {
+        // Use the file link as a unique identifier
+        const fileId = this.getFileId(fileLink);
+        const baseName = this.extractBaseName(fileName);
+        this.downloadedFiles[fileId] = {
+            fileName: fileName,
+            baseName: baseName,
+            downloadedAt: new Date().toISOString()
+        };
+        this.saveDownloadedFiles();
+        console.log('Marked file as downloaded:', fileName, 'baseName:', baseName);
+    }
+    
+    isFileDownloaded(fileLink) {
+        const fileId = this.getFileId(fileLink);
+        return this.downloadedFiles.hasOwnProperty(fileId);
+    }
+    
+    hasSiblingDownloaded(baseName) {
+        // Check if any file with the same baseName has been downloaded
+        const groupKey = this.getBaseNameGroupKey(baseName);
+        for (const fileId in this.downloadedFiles) {
+            const downloadedFile = this.downloadedFiles[fileId];
+            // For files downloaded before baseName was stored, compute it from fileName
+            const storedBaseName = downloadedFile.baseName || 
+                (downloadedFile.fileName ? this.extractBaseName(downloadedFile.fileName) : null);
+            if (storedBaseName != null && this.getBaseNameGroupKey(storedBaseName) === groupKey) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    getDownloadedSiblingInfo(baseName) {
+        // Get info about the downloaded sibling file
+        const groupKey = this.getBaseNameGroupKey(baseName);
+        for (const fileId in this.downloadedFiles) {
+            const downloadedFile = this.downloadedFiles[fileId];
+            // For files downloaded before baseName was stored, compute it from fileName
+            const storedBaseName = downloadedFile.baseName || 
+                (downloadedFile.fileName ? this.extractBaseName(downloadedFile.fileName) : null);
+            if (storedBaseName != null && this.getBaseNameGroupKey(storedBaseName) === groupKey) {
+                return downloadedFile;
+            }
+        }
+        return null;
+    }
+    
+    isBrandFullyDownloaded(brandFiles, cutoffTime = null) {
+        // Check if all files in a brand have been downloaded, ignored, or have a sibling downloaded/ignored
+        // Returns true if every baseName group has at least one download or all files are ignored
+        let hasAnyFiles = false;
+        
+        for (const [baseName, files] of brandFiles) {
+            // Filter files based on cutoff time if provided
+            const filteredFiles = cutoffTime 
+                ? files.filter(file => file.pubDate >= cutoffTime)
+                : files;
+            
+            // Skip if no files match the filter
+            if (filteredFiles.length === 0) {
+                continue;
+            }
+            
+            hasAnyFiles = true;
+            
+            // Check if any file in this baseName group is downloaded or has sibling downloaded
+            const hasDownload = filteredFiles.some(file => this.isFileDownloaded(file.link));
+            const hasSiblingDownload = this.hasSiblingDownloaded(baseName);
+            
+            // Check if all files in this group are ignored (or sibling ignored)
+            const allIgnored = filteredFiles.every(file => this.isFileIgnored(file.link));
+            const hasSiblingIgnored = this.hasSiblingIgnored(baseName);
+            
+            // Group is "reviewed" if it has a download, sibling download, or all files are ignored
+            if (!hasDownload && !hasSiblingDownload && !allIgnored && !hasSiblingIgnored) {
+                return false; // Found a baseName group with no downloads and not all ignored
+            }
+        }
+        
+        // Return true only if there were files and all were reviewed
+        return hasAnyFiles;
+    }
+    
+    getFileId(fileLink) {
+        // Create a simple hash/id from the file link
+        // Remove any query parameters that might change between sessions
+        try {
+            const url = new URL(fileLink, window.location.origin);
+            // Use pathname + key search params as the identifier
+            return url.pathname + (url.searchParams.get('id') || '');
+        } catch {
+            // Fallback to using the full link
+            return fileLink;
         }
     }
     
@@ -244,6 +426,172 @@ class RSSParser {
             console.log('Search filter ready');
         }
     }
+    
+    initializeUrlHistoryDropdown() {
+        const dropdownBtn = document.getElementById('url-dropdown-btn');
+        const dropdown = document.getElementById('url-history-dropdown');
+        const urlInput = document.getElementById('rss-url');
+        const clearHistoryBtn = document.getElementById('clear-url-history');
+        
+        if (!dropdownBtn || !dropdown || !urlInput) {
+            console.log('URL history dropdown elements not found');
+            return;
+        }
+        
+        // Toggle dropdown on button click
+        dropdownBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.toggleUrlDropdown();
+        });
+        
+        // Also toggle on input focus (optional, for convenience)
+        urlInput.addEventListener('focus', () => {
+            if (this.urlHistory.length > 0) {
+                this.showUrlDropdown();
+            }
+        });
+        
+        // Close dropdown when clicking outside
+        document.addEventListener('click', (e) => {
+            if (!dropdown.contains(e.target) && e.target !== dropdownBtn && e.target !== urlInput) {
+                this.hideUrlDropdown();
+            }
+        });
+        
+        // Clear history button
+        if (clearHistoryBtn) {
+            clearHistoryBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.clearUrlHistory();
+            });
+        }
+        
+        // Populate the dropdown initially
+        this.populateUrlHistoryDropdown();
+        
+        console.log('URL history dropdown ready');
+    }
+    
+    toggleUrlDropdown() {
+        const dropdown = document.getElementById('url-history-dropdown');
+        if (dropdown) {
+            const isVisible = dropdown.classList.contains('show');
+            if (isVisible) {
+                this.hideUrlDropdown();
+            } else {
+                this.showUrlDropdown();
+            }
+        }
+    }
+    
+    showUrlDropdown() {
+        const dropdown = document.getElementById('url-history-dropdown');
+        if (dropdown && this.urlHistory.length > 0) {
+            dropdown.classList.add('show');
+        }
+    }
+    
+    hideUrlDropdown() {
+        const dropdown = document.getElementById('url-history-dropdown');
+        if (dropdown) {
+            dropdown.classList.remove('show');
+        }
+    }
+    
+    populateUrlHistoryDropdown() {
+        const historyList = document.getElementById('url-history-list');
+        if (!historyList) return;
+        
+        if (this.urlHistory.length === 0) {
+            historyList.innerHTML = '<li class="url-history-empty">No recent URLs</li>';
+            return;
+        }
+        
+        let html = '';
+        this.urlHistory.forEach((url, index) => {
+            // Truncate long URLs for display
+            const displayUrl = url.length > 60 ? url.substring(0, 57) + '...' : url;
+            html += `
+                <li class="url-history-item" data-url="${this.escapeHtml(url)}" title="${this.escapeHtml(url)}">
+                    <span class="url-text">${this.escapeHtml(displayUrl)}</span>
+                    <button type="button" class="remove-url-btn" data-index="${index}" title="Remove from history">×</button>
+                </li>
+            `;
+        });
+        
+        historyList.innerHTML = html;
+        
+        // Add click handlers for history items
+        historyList.querySelectorAll('.url-history-item').forEach(item => {
+            item.addEventListener('click', (e) => {
+                if (!e.target.classList.contains('remove-url-btn')) {
+                    const url = item.getAttribute('data-url');
+                    this.selectUrlFromHistory(url);
+                }
+            });
+        });
+        
+        // Add click handlers for remove buttons
+        historyList.querySelectorAll('.remove-url-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const index = parseInt(btn.getAttribute('data-index'));
+                this.removeUrlFromHistory(index);
+            });
+        });
+    }
+    
+    selectUrlFromHistory(url) {
+        const urlInput = document.getElementById('rss-url');
+        if (urlInput) {
+            urlInput.value = url;
+            localStorage.setItem('rssParserDefaultUrl', url);
+        }
+        this.hideUrlDropdown();
+    }
+    
+    addUrlToHistory(url) {
+        if (!url || url.trim() === '') return;
+        
+        const trimmedUrl = url.trim();
+        
+        // Remove if already exists (to move to top)
+        const existingIndex = this.urlHistory.indexOf(trimmedUrl);
+        if (existingIndex !== -1) {
+            this.urlHistory.splice(existingIndex, 1);
+        }
+        
+        // Add to beginning
+        this.urlHistory.unshift(trimmedUrl);
+        
+        // Keep only last 10 URLs
+        if (this.urlHistory.length > 10) {
+            this.urlHistory = this.urlHistory.slice(0, 10);
+        }
+        
+        this.saveArray('rssParserUrlHistory', this.urlHistory);
+        this.populateUrlHistoryDropdown();
+    }
+    
+    removeUrlFromHistory(index) {
+        if (index >= 0 && index < this.urlHistory.length) {
+            this.urlHistory.splice(index, 1);
+            this.saveArray('rssParserUrlHistory', this.urlHistory);
+            this.populateUrlHistoryDropdown();
+            
+            // Hide dropdown if empty
+            if (this.urlHistory.length === 0) {
+                this.hideUrlDropdown();
+            }
+        }
+    }
+    
+    clearUrlHistory() {
+        this.urlHistory = [];
+        this.saveArray('rssParserUrlHistory', this.urlHistory);
+        this.populateUrlHistoryDropdown();
+        this.hideUrlDropdown();
+    }
 
     async fetchRSS() {
         console.log('=== fetchRSS called ===');
@@ -254,6 +602,9 @@ class RSSParser {
             alert('Please enter an RSS feed URL first.');
             return;
         }
+        
+        // Save URL to history
+        this.addUrlToHistory(rssUrl);
 
         try {
             console.log('Starting fetch process for:', rssUrl);
@@ -339,11 +690,12 @@ class RSSParser {
                     }
                     
                     const brandFiles = this.brands.get(fileInfo.brand);
-                    if (!brandFiles.has(fileInfo.baseName)) {
-                        brandFiles.set(fileInfo.baseName, []);
+                    const groupKey = this.getBaseNameGroupKey(fileInfo.baseName);
+                    if (!brandFiles.has(groupKey)) {
+                        brandFiles.set(groupKey, []);
                     }
                     
-                    brandFiles.get(fileInfo.baseName).push(fileInfo);
+                    brandFiles.get(groupKey).push(fileInfo);
                 }
             });
             
@@ -421,21 +773,42 @@ class RSSParser {
         for (const pattern of patterns) {
             const match = filename.match(pattern);
             if (match && match[1]) {
-                return match[1];
+                // Normalize case: first letter uppercase, rest lowercase
+                return this.normalizeBrandName(match[1]);
             }
         }
         
         return 'Unknown';
+    }
+    
+    normalizeBrandName(brand) {
+        // Normalize brand name to consistent case: first letter uppercase, rest lowercase
+        if (!brand || brand.length === 0) return brand;
+        return brand.charAt(0).toUpperCase() + brand.slice(1).toLowerCase();
     }
 
     extractBaseName(filename) {
         // Remove file extension and common suffixes
         let baseName = filename.replace(/\.(nzb|zip|rar|mp4|mkv|avi)$/i, '');
         
-        // Remove quality indicators and common suffixes
-        baseName = baseName.replace(/[\.\-_](720p|1080p|480p|2160p|4K|HDRip|BDRip|DVDRip|WEBRip|HDTV|x264|x265|H264|H265|AAC|AC3|DTS|XXX)[\.\-_].*$/i, '');
+        // Remove quality indicators and common suffixes (XXX, resolution, codec, etc.)
+        baseName = baseName.replace(/[\.\-_](720p|1080p|480p|2160p|4K|HDRip|BDRip|DVDRip|WEBRip|HDTV|x264|x265|H264|H265|AAC|AC3|DTS|XXX)[\.\-_\s].*$/i, '');
+        
+        // Remove trailing group-style suffixes (e.g. -WRB, -XXX, -RARBG)
+        baseName = baseName.replace(/-[A-Z0-9]+$/i, '');
+        baseName = baseName.replace(/\.+/g, '.').replace(/^\.|\.$/g, '').trim();
         
         return baseName || filename;
+    }
+    
+    /**
+     * Canonical key for grouping and sibling checks. Case-insensitive so that
+     * "18lust.26.02.25.nerea.porn.audition" and "18Lust.26.02.25.Nerea.Porn.Audition"
+     * (same content, different resolution/XXX suffix) group as one.
+     */
+    getBaseNameGroupKey(baseName) {
+        if (baseName == null || baseName === '') return '';
+        return String(baseName).toLowerCase().trim();
     }
     
     isFileExcluded(filename) {
@@ -565,6 +938,9 @@ class RSSParser {
                 return;
             }
             
+            // Check if all content in this brand has been downloaded
+            const isFullyDownloaded = this.isBrandFullyDownloaded(brandFiles, cutoffTime);
+            
             // Get latest file date for this brand (from filtered files)
             let brandLatestDate = null;
             brandFiles.forEach(files => {
@@ -579,10 +955,17 @@ class RSSParser {
                 });
             });
             
+            const brandClasses = [
+                'brand-item',
+                isFavorite ? 'favorite' : '',
+                isAntiFavorite ? 'anti-favorite' : '',
+                isFullyDownloaded ? 'fully-downloaded' : ''
+            ].filter(Boolean).join(' ');
+            
             html += `
-                <div class="brand-item ${isFavorite ? 'favorite' : ''} ${isAntiFavorite ? 'anti-favorite' : ''}" data-brand="${this.escapeHtml(brandName)}">
+                <div class="${brandClasses}" data-brand="${this.escapeHtml(brandName)}">
                     <div class="brand-header">
-                        <h3>${this.escapeHtml(brandName)} (${filesHTML.filteredFileCount} files)</h3>
+                        <h3>${this.escapeHtml(brandName)} (${filesHTML.filteredFileCount} files)${isFullyDownloaded ? ' <span class="fully-downloaded-badge">✓ All Reviewed</span>' : ''}</h3>
                         <div class="brand-controls">
                             <span class="brand-latest">${brandLatestDate ? this.getTimeAgo(brandLatestDate) : ''}</span>
                             <button class="favorite-btn ${isFavorite ? 'active' : ''}" data-action="favorite" data-brand="${this.escapeHtml(brandName)}">
@@ -591,6 +974,7 @@ class RSSParser {
                             <button class="anti-favorite-btn ${isAntiFavorite ? 'active' : ''}" data-action="anti-favorite" data-brand="${this.escapeHtml(brandName)}">
                                 ${isAntiFavorite ? '✖' : '○'}
                             </button>
+                            <button class="exclude-brand-btn ${this.excludeKeywords.map(k => k.toLowerCase()).includes(brandName.toLowerCase()) ? 'active' : ''}" data-action="exclude-brand" data-brand="${this.escapeHtml(brandName)}" title="Add brand to exclude list">Exclude</button>
                             <button class="expand-btn" data-action="expand" data-brand="${this.escapeHtml(brandName)}">▼</button>
                         </div>
                     </div>
@@ -613,15 +997,34 @@ class RSSParser {
     setupBrandEventDelegation(container) {
         // Create a handler function for this specific container
         const handleBrandClick = (e) => {
-            console.log('Click detected on:', e.target);
-            const button = e.target;
+            const target = e.target;
+            
+            // Handle download button clicks
+            if (target.classList.contains('download-btn')) {
+                const fileLink = target.getAttribute('data-file-link');
+                const fileName = target.getAttribute('data-file-name');
+                if (fileLink && fileName) {
+                    this.handleDownloadClick(target, fileLink, fileName);
+                }
+                return;
+            }
+            
+            // Handle ignore button clicks
+            if (target.classList.contains('ignore-btn')) {
+                const fileLink = target.getAttribute('data-file-link');
+                const fileName = target.getAttribute('data-file-name');
+                if (fileLink && fileName) {
+                    this.handleIgnoreClick(target, fileLink, fileName);
+                }
+                return;
+            }
+            
+            // Handle brand control buttons
+            const button = target;
             const action = button.getAttribute('data-action');
             const brandName = button.getAttribute('data-brand');
             
-            console.log('Button attributes - action:', action, 'brandName:', brandName);
-            
             if (!action || !brandName) {
-                console.log('Missing action or brandName, ignoring click');
                 return;
             }
             
@@ -629,13 +1032,18 @@ class RSSParser {
             
             switch (action) {
                 case 'expand':
-                    this.toggleBrandExpansion(brandName);
+                    // Pass the clicked button so we can find the correct brand item
+                    this.toggleBrandExpansion(brandName, button);
                     break;
                 case 'favorite':
                     this.toggleFavorite(brandName);
                     break;
                 case 'anti-favorite':
                     this.toggleAntiFavorite(brandName);
+                    break;
+                case 'exclude-brand':
+                    this.addExcludeKeyword(this.normalizeBrandName(brandName));
+                    this.displayResults();
                     break;
             }
         };
@@ -648,6 +1056,171 @@ class RSSParser {
         // Store the handler on the container and add the listener
         container._brandClickHandler = handleBrandClick;
         container.addEventListener('click', handleBrandClick);
+    }
+    
+    handleDownloadClick(buttonElement, fileLink, fileName) {
+        // Mark the file as downloaded
+        this.markFileAsDownloaded(fileLink, fileName);
+        
+        // Update ALL buttons with the same file link across all tabs
+        const allMatchingButtons = document.querySelectorAll(`.download-btn[data-file-link="${CSS.escape(fileLink)}"]`);
+        allMatchingButtons.forEach(btn => {
+            btn.classList.add('downloaded');
+            btn.classList.remove('sibling-downloaded');
+            btn.textContent = '✓ Downloaded';
+            
+            // Also mark the parent file-item as downloaded
+            const fileItem = btn.closest('.file-item');
+            if (fileItem) {
+                fileItem.classList.add('downloaded');
+                fileItem.classList.remove('sibling-downloaded');
+            }
+        });
+        
+        // Also update sibling files (same baseName, different quality)
+        const baseName = this.extractBaseName(fileName);
+        this.updateSiblingDownloadStatus(baseName, fileLink);
+        
+        // Update fully-downloaded status for affected brands
+        this.updateBrandDownloadStatus();
+    }
+    
+    handleIgnoreClick(buttonElement, fileLink, fileName) {
+        const isCurrentlyIgnored = this.isFileIgnored(fileLink);
+        
+        if (isCurrentlyIgnored) {
+            // Unignore the file
+            this.unignoreFile(fileLink);
+            
+            // Update ALL ignore buttons with the same file link across all tabs
+            const allMatchingButtons = document.querySelectorAll(`.ignore-btn[data-file-link="${CSS.escape(fileLink)}"]`);
+            allMatchingButtons.forEach(btn => {
+                btn.classList.remove('ignored');
+                btn.textContent = 'Ignore';
+                
+                // Also update the parent file-item
+                const fileItem = btn.closest('.file-item');
+                if (fileItem) {
+                    fileItem.classList.remove('ignored');
+                }
+            });
+        } else {
+            // Ignore the file
+            this.markFileAsIgnored(fileLink, fileName);
+            
+            // Update ALL ignore buttons with the same file link across all tabs
+            const allMatchingButtons = document.querySelectorAll(`.ignore-btn[data-file-link="${CSS.escape(fileLink)}"]`);
+            allMatchingButtons.forEach(btn => {
+                btn.classList.add('ignored');
+                btn.textContent = '✓ Ignored';
+                
+                // Also mark the parent file-item as ignored
+                const fileItem = btn.closest('.file-item');
+                if (fileItem) {
+                    fileItem.classList.add('ignored');
+                }
+            });
+        }
+        
+        // Update fully-downloaded status for affected brands
+        this.updateBrandDownloadStatus();
+    }
+    
+    updateSiblingDownloadStatus(baseName, excludeFileLink) {
+        // Find and update all files with the same baseName that aren't already downloaded
+        const groupKey = this.getBaseNameGroupKey(baseName);
+        document.querySelectorAll('.download-btn').forEach(btn => {
+            const btnFileLink = btn.getAttribute('data-file-link');
+            const btnFileName = btn.getAttribute('data-file-name');
+            
+            // Skip if this is the file we just downloaded or if already marked as downloaded
+            if (btnFileLink === excludeFileLink || btn.classList.contains('downloaded')) {
+                return;
+            }
+            
+            // Check if this file has the same baseName (case-insensitive group key)
+            if (btnFileName && this.getBaseNameGroupKey(this.extractBaseName(btnFileName)) === groupKey) {
+                // Mark as sibling downloaded if not already
+                if (!btn.classList.contains('sibling-downloaded')) {
+                    btn.classList.add('sibling-downloaded');
+                    btn.textContent = '↳ Other Quality';
+                    
+                    const fileItem = btn.closest('.file-item');
+                    if (fileItem && !fileItem.classList.contains('sibling-downloaded')) {
+                        fileItem.classList.add('sibling-downloaded');
+                    }
+                }
+            }
+        });
+    }
+    
+    updateBrandDownloadStatus() {
+        // Calculate cutoff time if filter is active
+        const cutoffTime = this.timeFilter > 0 
+            ? new Date(Date.now() - (this.timeFilter * 60 * 60 * 1000))
+            : null;
+        
+        // Update all brand items in all containers
+        document.querySelectorAll('.brand-item').forEach(brandItem => {
+            const brandName = brandItem.getAttribute('data-brand');
+            if (!brandName || !this.brands.has(brandName)) return;
+            
+            const brandFiles = this.brands.get(brandName);
+            const isFullyDownloaded = this.isBrandFullyDownloaded(brandFiles, cutoffTime);
+            
+            // Update the brand item classes
+            if (isFullyDownloaded) {
+                brandItem.classList.add('fully-downloaded');
+                
+                // Add badge if not present
+                const header = brandItem.querySelector('.brand-header h3');
+                if (header && !header.querySelector('.fully-downloaded-badge')) {
+                    header.insertAdjacentHTML('beforeend', ' <span class="fully-downloaded-badge">✓ All Reviewed</span>');
+                }
+            } else {
+                brandItem.classList.remove('fully-downloaded');
+                
+                // Remove badge if present
+                const badge = brandItem.querySelector('.fully-downloaded-badge');
+                if (badge) {
+                    badge.remove();
+                }
+            }
+        });
+    }
+    
+    setupDownloadEventDelegation(container) {
+        // Create a handler function for download and ignore buttons
+        const handleButtonClick = (e) => {
+            const target = e.target;
+            
+            // Handle download button clicks
+            if (target.classList.contains('download-btn')) {
+                const fileLink = target.getAttribute('data-file-link');
+                const fileName = target.getAttribute('data-file-name');
+                if (fileLink && fileName) {
+                    this.handleDownloadClick(target, fileLink, fileName);
+                }
+            }
+            
+            // Handle ignore button clicks
+            if (target.classList.contains('ignore-btn')) {
+                const fileLink = target.getAttribute('data-file-link');
+                const fileName = target.getAttribute('data-file-name');
+                if (fileLink && fileName) {
+                    this.handleIgnoreClick(target, fileLink, fileName);
+                }
+            }
+        };
+        
+        // Remove any existing listener if present
+        if (container._downloadClickHandler) {
+            container.removeEventListener('click', container._downloadClickHandler);
+        }
+        
+        // Store the handler on the container and add the listener
+        container._downloadClickHandler = handleButtonClick;
+        container.addEventListener('click', handleButtonClick);
     }
     
     generateBrandFilesHTML(brandFiles, cutoffTime = null) {
@@ -673,25 +1246,54 @@ class RSSParser {
             
             filteredFileCount += filteredFiles.length;
             
+            // Use first file's baseName for display (group key is lowercase for grouping only)
+            const displayName = filteredFiles[0].baseName || baseName;
             html += `<div class="file-group">`;
-            html += `<h4>${baseName} (${filteredFiles.length} versions)</h4>`;
+            html += `<h4>${this.escapeHtml(displayName)} (${filteredFiles.length} versions)</h4>`;
             
             filteredFiles.forEach(file => {
                 const ageClass = this.getAgeClass(file.pubDate);
                 const correctedFilename = this.ensureFilenameHasXXX(file.name);
                 const proxyDownloadUrl = `/proxy/download?url=${encodeURIComponent(file.link)}&filename=${encodeURIComponent(correctedFilename)}`;
+                const isDownloaded = this.isFileDownloaded(file.link);
+                const isIgnored = this.isFileIgnored(file.link);
+                const hasSiblingDownloaded = !isDownloaded && !isIgnored && this.hasSiblingDownloaded(baseName);
+                
+                let fileItemClass = ageClass;
+                let downloadBtnClass = 'download-btn';
+                let downloadBtnText = 'Download NZB';
+                let ignoreBtnClass = 'ignore-btn';
+                let ignoreBtnText = 'Ignore';
+                
+                if (isDownloaded) {
+                    fileItemClass += ' downloaded';
+                    downloadBtnClass = 'download-btn downloaded';
+                    downloadBtnText = '✓ Downloaded';
+                } else if (isIgnored) {
+                    fileItemClass += ' ignored';
+                    ignoreBtnClass = 'ignore-btn ignored';
+                    ignoreBtnText = '✓ Ignored';
+                } else if (hasSiblingDownloaded) {
+                    fileItemClass += ' sibling-downloaded';
+                    downloadBtnClass = 'download-btn sibling-downloaded';
+                    downloadBtnText = '↳ Other Quality';
+                }
+                
                 html += `
-                    <div class="file-item ${ageClass}">
-            <div class="file-info">
+                    <div class="file-item ${fileItemClass}">
+                        <div class="file-info">
                             <span class="file-name">${file.name}</span>
                             <div class="file-meta">
-                    <span class="file-size">${file.size}</span>
+                                <span class="file-size">${file.size}</span>
                                 <span class="file-age">${file.timeAgo}</span>
-                </div>
-            </div>
-                        <a href="${proxyDownloadUrl}" class="download-btn">Download NZB</a>
-            </div>
-        `;
+                            </div>
+                        </div>
+                        <div class="file-actions">
+                            <button class="${ignoreBtnClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">${ignoreBtnText}</button>
+                            <a href="${proxyDownloadUrl}" class="${downloadBtnClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">${downloadBtnText}</a>
+                        </div>
+                    </div>
+                `;
             });
             
             html += `</div>`;
@@ -708,9 +1310,17 @@ class RSSParser {
         return 'age-old';
     }
     
-    toggleBrandExpansion(brandName) {
+    toggleBrandExpansion(brandName, clickedButton) {
         console.log('toggleBrandExpansion called for:', brandName);
-        const brandItem = document.querySelector(`[data-brand="${brandName}"]`);
+        
+        // Find the brand item that contains the clicked button
+        // This ensures we expand the correct one when the same brand appears in multiple tabs
+        let brandItem;
+        if (clickedButton) {
+            brandItem = clickedButton.closest('.brand-item');
+        } else {
+            brandItem = document.querySelector(`[data-brand="${brandName}"]`);
+        }
         console.log('Found brand item:', brandItem);
         
         if (!brandItem) {
@@ -748,9 +1358,10 @@ class RSSParser {
     }
     
     toggleFavorite(brandName) {
-        const index = this.favoriteBrands.indexOf(brandName);
+        const normalizedName = this.normalizeBrandName(brandName);
+        const index = this.favoriteBrands.indexOf(normalizedName);
         if (index === -1) {
-            this.favoriteBrands.push(brandName);
+            this.favoriteBrands.push(normalizedName);
         } else {
             this.favoriteBrands.splice(index, 1);
         }
@@ -760,9 +1371,10 @@ class RSSParser {
     }
     
     addFavoriteBrand(brandName) {
-        console.log('Adding favorite brand:', brandName);
-        if (!this.favoriteBrands.includes(brandName)) {
-            this.favoriteBrands.push(brandName);
+        const normalizedName = this.normalizeBrandName(brandName);
+        console.log('Adding favorite brand:', normalizedName);
+        if (!this.favoriteBrands.includes(normalizedName)) {
+            this.favoriteBrands.push(normalizedName);
             this.saveArray('rssParserFavoriteBrands', this.favoriteBrands);
             console.log('Favorite brands after add:', this.favoriteBrands);
             this.displayFavoritesAndKeywords();
@@ -777,7 +1389,8 @@ class RSSParser {
     }
     
     removeFavoriteBrand(brandName) {
-        const index = this.favoriteBrands.indexOf(brandName);
+        const normalizedName = this.normalizeBrandName(brandName);
+        const index = this.favoriteBrands.indexOf(normalizedName);
         if (index !== -1) {
             this.favoriteBrands.splice(index, 1);
             this.saveArray('rssParserFavoriteBrands', this.favoriteBrands);
@@ -791,9 +1404,10 @@ class RSSParser {
     }
     
     toggleAntiFavorite(brandName) {
-        const index = this.antiFavoriteBrands.indexOf(brandName);
+        const normalizedName = this.normalizeBrandName(brandName);
+        const index = this.antiFavoriteBrands.indexOf(normalizedName);
         if (index === -1) {
-            this.antiFavoriteBrands.push(brandName);
+            this.antiFavoriteBrands.push(normalizedName);
         } else {
             this.antiFavoriteBrands.splice(index, 1);
         }
@@ -1139,6 +1753,9 @@ class RSSParser {
                 const filesHTML = this.generateBrandFilesHTML(brandFiles);
                 console.log(`  Brand ${brandName} has ${filesHTML.filteredFileCount} files`);
                 
+                // Check if all content in this brand has been downloaded
+                const isFullyDownloaded = this.isBrandFullyDownloaded(brandFiles);
+                
                 // Get latest date for this brand
                 let latestDate = null;
                 brandFiles.forEach(files => {
@@ -1149,10 +1766,16 @@ class RSSParser {
                     });
                 });
                 
+                const brandClasses = [
+                    'brand-item',
+                    'favorite',
+                    isFullyDownloaded ? 'fully-downloaded' : ''
+                ].filter(Boolean).join(' ');
+                
                 html += `
-                    <div class="brand-item favorite" data-brand="${this.escapeHtml(brandName)}">
+                    <div class="${brandClasses}" data-brand="${this.escapeHtml(brandName)}">
                         <div class="brand-header">
-                            <h3>${this.escapeHtml(brandName)} (${filesHTML.filteredFileCount} files)</h3>
+                            <h3>${this.escapeHtml(brandName)} (${filesHTML.filteredFileCount} files)${isFullyDownloaded ? ' <span class="fully-downloaded-badge">✓ All Reviewed</span>' : ''}</h3>
                             <div class="brand-controls">
                                 <span class="brand-latest">${latestDate ? this.getTimeAgo(latestDate) : ''}</span>
                                 <button class="expand-btn" data-action="expand" data-brand="${this.escapeHtml(brandName)}">▼</button>
@@ -1230,8 +1853,33 @@ class RSSParser {
             const ageClass = this.getAgeClass(file.pubDate);
             const correctedFilename = this.ensureFilenameHasXXX(file.name);
             const proxyDownloadUrl = `/proxy/download?url=${encodeURIComponent(file.link)}&filename=${encodeURIComponent(correctedFilename)}`;
+            const isDownloaded = this.isFileDownloaded(file.link);
+            const isIgnored = this.isFileIgnored(file.link);
+            const baseName = this.extractBaseName(file.name);
+            const hasSiblingDownloaded = !isDownloaded && !isIgnored && this.hasSiblingDownloaded(baseName);
+            
+            let fileItemClass = `${ageClass} keyword-match`;
+            let downloadBtnClass = 'download-btn';
+            let downloadBtnText = 'Download NZB';
+            let ignoreBtnClass = 'ignore-btn';
+            let ignoreBtnText = 'Ignore';
+            
+            if (isDownloaded) {
+                fileItemClass += ' downloaded';
+                downloadBtnClass = 'download-btn downloaded';
+                downloadBtnText = '✓ Downloaded';
+            } else if (isIgnored) {
+                fileItemClass += ' ignored';
+                ignoreBtnClass = 'ignore-btn ignored';
+                ignoreBtnText = '✓ Ignored';
+            } else if (hasSiblingDownloaded) {
+                fileItemClass += ' sibling-downloaded';
+                downloadBtnClass = 'download-btn sibling-downloaded';
+                downloadBtnText = '↳ Other Quality';
+            }
+            
             html += `
-                <div class="file-item ${ageClass} keyword-match">
+                <div class="file-item ${fileItemClass}">
                     <div class="file-info">
                         <span class="file-brand">[${this.escapeHtml(file.brandName)}]</span>
                         <span class="file-name">${this.highlightKeywords(file.name)}</span>
@@ -1241,13 +1889,19 @@ class RSSParser {
                             <span class="matched-keywords">Keywords: ${file.matchedKeywords.join(', ')}</span>
                         </div>
                     </div>
-                    <a href="${proxyDownloadUrl}" class="download-btn">Download NZB</a>
+                    <div class="file-actions">
+                        <button class="${ignoreBtnClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">${ignoreBtnText}</button>
+                        <a href="${proxyDownloadUrl}" class="${downloadBtnClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">${downloadBtnText}</a>
+                    </div>
                 </div>
             `;
         });
         
         html += '</div>';
         container.innerHTML = html;
+        
+        // Set up event delegation for download buttons in keyword matches
+        this.setupDownloadEventDelegation(container);
     }
     
     highlightKeywords(text) {
@@ -1333,9 +1987,33 @@ class RSSParser {
             const ageClass = this.getAgeClass(file.pubDate);
             const correctedFilename = this.ensureFilenameHasXXX(file.name);
             const proxyDownloadUrl = `/proxy/download?url=${encodeURIComponent(file.link)}&filename=${encodeURIComponent(correctedFilename)}`;
+            const isDownloaded = this.isFileDownloaded(file.link);
+            const isIgnored = this.isFileIgnored(file.link);
+            const baseName = this.extractBaseName(file.name);
+            const hasSiblingDownloaded = !isDownloaded && !isIgnored && this.hasSiblingDownloaded(baseName);
+            
+            let fileItemClass = `excluded ${ageClass}`;
+            let downloadBtnClass = 'download-btn';
+            let downloadBtnText = 'Download NZB';
+            let ignoreBtnClass = 'ignore-btn';
+            let ignoreBtnText = 'Ignore';
+            
+            if (isDownloaded) {
+                fileItemClass += ' downloaded';
+                downloadBtnClass = 'download-btn downloaded';
+                downloadBtnText = '✓ Downloaded';
+            } else if (isIgnored) {
+                fileItemClass += ' ignored';
+                ignoreBtnClass = 'ignore-btn ignored';
+                ignoreBtnText = '✓ Ignored';
+            } else if (hasSiblingDownloaded) {
+                fileItemClass += ' sibling-downloaded';
+                downloadBtnClass = 'download-btn sibling-downloaded';
+                downloadBtnText = '↳ Other Quality';
+            }
             
             html += `
-                <div class="file-item excluded ${ageClass}">
+                <div class="file-item ${fileItemClass}">
                     <div class="file-info">
                         <span class="file-name">${this.escapeHtml(file.name)}</span>
                         <div class="file-meta">
@@ -1344,12 +2022,18 @@ class RSSParser {
                             <span class="file-age">${file.timeAgo}</span>
                         </div>
                     </div>
-                    <a href="${proxyDownloadUrl}" class="download-btn">Download NZB</a>
+                    <div class="file-actions">
+                        <button class="${ignoreBtnClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">${ignoreBtnText}</button>
+                        <a href="${proxyDownloadUrl}" class="${downloadBtnClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">${downloadBtnText}</a>
+                    </div>
                 </div>
             `;
         });
         
         container.innerHTML = html;
+        
+        // Set up event delegation for download buttons in excluded files
+        this.setupDownloadEventDelegation(container);
     }
     
     getMatchedExcludeKeyword(filename) {
