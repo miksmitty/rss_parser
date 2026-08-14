@@ -7,14 +7,13 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>RSS File Parser</h1>
-            <p>Fetch and organize RSS feed files by brand</p>
-        </header>
-        
-        <main>
-            <div class="input-section">
+    <div class="app">
+        <header class="app-header">
+            <div class="app-header-inner">
+                <div class="app-brand">
+                    <h1>RSS File Parser</h1>
+                    <p>Organize feed files by brand</p>
+                </div>
                 <div class="url-input-group">
                     <div class="url-dropdown-wrapper">
                         <input type="url" id="rss-url" placeholder="Enter RSS feed URL" autocomplete="off">
@@ -31,9 +30,39 @@
                     </div>
                     <button id="fetch-btn" class="btn btn-primary">Fetch RSS</button>
                 </div>
-                
-                <div class="time-filter-section">
-                    <label for="time-filter">Show files from last:</label>
+            </div>
+        </header>
+
+        <main class="app-layout">
+            <aside class="sidebar">
+                <div class="control-panel">
+                    <h4 class="control-panel-title">Search</h4>
+                    <div class="performer-search-section">
+                        <label for="performer-search">Performer search</label>
+                        <div class="performer-search-row">
+                            <input type="text" id="performer-search" placeholder="e.g. Sophie Tyler" autocomplete="off" class="performer-search-input">
+                            <button type="button" id="performer-search-btn" class="btn btn-primary">Search</button>
+                        </div>
+                        <label class="save-search-option" title="Add this search term to the quick search list">
+                            <input type="checkbox" id="save-search-term" checked>
+                            <span>Save search term to quick search</span>
+                        </label>
+                    </div>
+
+                    <div class="quick-search" id="quick-search" hidden>
+                        <button type="button" class="quick-search-toggle" id="quick-search-toggle" aria-expanded="false">
+                            <span class="qs-chevron">▸</span>
+                            <span>Quick search from favourites &amp; keywords</span>
+                            <span class="qs-count" id="quick-search-count"></span>
+                        </button>
+                        <div class="quick-search-chips" id="quick-search-chips" hidden></div>
+                    </div>
+                </div>
+
+                <div class="control-panel">
+                    <h4 class="control-panel-title">Filters</h4>
+                    <div class="time-filter-section">
+                    <label for="time-filter">Show files from last</label>
                     <select id="time-filter">
                         <option value="0">All time</option>
                         <option value="1">1 hour</option>
@@ -51,14 +80,40 @@
                         <option value="720">1 month</option>
                     </select>
                     <span class="filter-info" id="filter-info">Showing all files</span>
+                    </div>
+
+                    <div class="size-filter-section">
+                        <label for="size-min">File size between</label>
+                        <div class="size-row">
+                            <input type="number" id="size-min" min="0" step="0.1" placeholder="min" class="size-input">
+                            <span class="size-dash">–</span>
+                            <input type="number" id="size-max" min="0" step="0.1" placeholder="max" class="size-input">
+                            <select id="size-unit">
+                                <option value="GB" selected>GB</option>
+                                <option value="MB">MB</option>
+                            </select>
+                        </div>
+                        <label for="size-preferred" class="size-sublabel">Highlight nearest</label>
+                        <div class="size-row">
+                            <input type="number" id="size-preferred" min="0" step="0.1" placeholder="1" class="size-input">
+                            <button type="button" id="size-filter-clear" class="btn btn-secondary btn-small">Clear</button>
+                        </div>
+                        <span class="filter-info" id="size-filter-info">Showing all sizes</span>
+                    </div>
                 </div>
-                
-                <div class="button-group">
-                    <button id="clear-btn" class="btn btn-secondary">Clear</button>
-                    <button id="load-sample-btn" class="btn btn-secondary">Load Sample</button>
+
+                <div class="control-panel">
+                    <h4 class="control-panel-title">Actions</h4>
+                    <div class="button-group">
+                        <button id="clear-btn" class="btn btn-secondary">Clear</button>
+                        <button id="load-sample-btn" class="btn btn-secondary">Load Sample</button>
+                        <button id="clear-sabnzb-history-btn" class="btn btn-secondary sabnzb-history-btn" title="Clear all completed/failed items in SABnzbd history" style="display: none;">Clear SABnzb history</button>
+                        <button id="restart-server-btn" class="btn btn-secondary" title="Restart the Node server">Restart server</button>
+                    </div>
                 </div>
-            </div>
-            
+            </aside>
+
+            <section class="content">
             <div class="tabs-container">
                 <div class="tabs-header">
                     <button class="tab-btn active" data-tab="results">Results</button>
@@ -71,8 +126,8 @@
                     <div class="results-section" id="results-section" style="display: none;">
                         <div class="stats">
                             <div class="stats-row">
-                                <span id="total-files">0</span> files found across <span id="total-brands">0</span> brands
-                                <span id="excluded-count" style="margin-left: 15px; color: #dc3545;">(<span id="excluded-files-count">0</span> excluded)</span>
+                                <span class="stats-summary"><strong id="total-files">0</strong> files found across <strong id="total-brands">0</strong> brands</span>
+                                <span id="excluded-count">(<span id="excluded-files-count">0</span> excluded)</span>
                             </div>
                             <div class="stats-row">
                                 <span class="latest-upload">Latest upload: <span id="latest-upload-date">None</span></span>
@@ -83,6 +138,9 @@
                         <div class="search-section">
                             <input type="text" id="results-search" placeholder="Search files by name..." class="search-input">
                             <span class="search-status" id="search-status"></span>
+                            <label class="hide-fully-reviewed-option">
+                                <input type="checkbox" id="hide-fully-reviewed" value="1"> Hide fully reviewed
+                            </label>
                         </div>
                         
                         <div class="brands-container" id="brands-container">
@@ -113,6 +171,19 @@
                                 </div>
                             </div>
                         
+                        <div class="search-section favorites-toolbar">
+                            <input type="text" id="favorites-search" placeholder="Search by brand or file name..." class="search-input">
+                            <label for="favorites-sort" class="favorites-sort-label">Sort:</label>
+                            <select id="favorites-sort">
+                                <option value="custom">My order</option>
+                                <option value="name-asc">Name A→Z</option>
+                                <option value="name-desc">Name Z→A</option>
+                                <option value="latest">Latest upload</option>
+                                <option value="files">Most files</option>
+                            </select>
+                            <span class="search-status" id="favorites-search-status"></span>
+                        </div>
+
                         <div class="favorites-content-full">
                             <div class="favorites-section-full">
                                 <h4>Favorite Brands</h4>
@@ -141,6 +212,10 @@
                         <div class="favorites-content">
                             <div class="favorites-column">
                                 <h4>Favorite Brands</h4>
+                                <div class="tag-list-tools">
+                                    <input type="text" class="tag-filter-input" data-type="favorite" placeholder="Search favourites...">
+                                    <button class="tag-sort-btn" data-type="favorite" title="Sort alphabetically">A→Z</button>
+                                </div>
                                 <div class="favorites-list" id="favorite-brands-list">
                                     <!-- Favorite brands will be populated here -->
                                 </div>
@@ -152,6 +227,10 @@
                             
                             <div class="favorites-column">
                                 <h4>Highlight Keywords</h4>
+                                <div class="tag-list-tools">
+                                    <input type="text" class="tag-filter-input" data-type="keyword" placeholder="Search keywords...">
+                                    <button class="tag-sort-btn" data-type="keyword" title="Sort alphabetically">A→Z</button>
+                                </div>
                                 <div class="keywords-list" id="keywords-list">
                                     <!-- Keywords will be populated here -->
                                 </div>
@@ -163,6 +242,10 @@
                             
                             <div class="favorites-column">
                                 <h4>Exclude Keywords</h4>
+                                <div class="tag-list-tools">
+                                    <input type="text" class="tag-filter-input" data-type="exclude" placeholder="Search exclude keywords...">
+                                    <button class="tag-sort-btn" data-type="exclude" title="Sort alphabetically">A→Z</button>
+                                </div>
                                 <div class="exclude-keywords-list" id="exclude-keywords-list">
                                     <!-- Exclude keywords will be populated here -->
                                 </div>
@@ -204,8 +287,11 @@
                     </div>
                 </div>
             </div>
+            </section>
         </main>
     </div>
+
+    <button type="button" id="scroll-to-top-btn" class="scroll-to-top-btn" title="Scroll to top" aria-label="Scroll to top"><span class="stt-arrow">↑</span> Back to top</button>
     
     <script src="script.js"></script>
 </body>

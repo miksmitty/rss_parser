@@ -9,7 +9,12 @@ class RSSParser {
         this.brands = new Map();
         this.excludedFiles = [];
         this.timeFilter = 0;
-        
+        // Size filter boundaries in bytes (0 = no bound)
+        this.minSizeBytes = 0;
+        this.maxSizeBytes = 0;
+        // Target size for the "preferred" highlight (defaults to 1 GB)
+        this.preferredSizeBytes = 1024 * 1024 * 1024;
+
         // Load saved data safely
         this.favoriteBrands = this.loadArray('rssParserFavoriteBrands');
         this.antiFavoriteBrands = this.loadArray('rssParserAntiFavoriteBrands'); 
@@ -18,6 +23,10 @@ class RSSParser {
         this.downloadedFiles = this.loadDownloadedFiles();
         this.ignoredFiles = this.loadIgnoredFiles();
         this.urlHistory = this.loadArray('rssParserUrlHistory');
+        this.sabnzbConfigured = false;
+        // Favorites tab sort mode (persisted); "custom" keeps the user's own
+        // favourites order / alphabetical keyword-match order
+        this.favoritesSortMode = localStorage.getItem('rssParserFavoritesSort') || 'custom';
         
         // Load default RSS URL (most recent from history or saved default)
         const savedUrl = localStorage.getItem('rssParserDefaultUrl');
@@ -33,10 +42,15 @@ class RSSParser {
         this.initializeBasicEvents();
         this.initializeSimpleTabs();
         this.initializeTimeFilter();
+        this.initializeHideFullyReviewed();
         this.initializeKeywordManagement();
         this.initializeSearchFilter();
         this.initializeUrlHistoryDropdown();
-        
+        this.initializeQuickSearchToggle();
+        this.initializeSizeFilter();
+        this.initializeTagListTools();
+        this.initializeFavoritesTools();
+
         // Display saved favorites and keywords
         setTimeout(() => {
             console.log('Displaying favorites and keywords...');
@@ -44,6 +58,7 @@ class RSSParser {
             console.log('Keywords:', this.keywords);
             console.log('Exclude keywords:', this.excludeKeywords);
             this.displayFavoritesAndKeywords();
+            this.fetchSabNZBStatus();
         }, 100);
         
         console.log('RSSParser initialized successfully');
@@ -67,7 +82,26 @@ class RSSParser {
             console.error(`Error saving ${key}:`, error);
         }
     }
-    
+
+    loadObject(key) {
+        try {
+            const saved = localStorage.getItem(key);
+            const parsed = saved ? JSON.parse(saved) : null;
+            return (parsed && typeof parsed === 'object') ? parsed : null;
+        } catch (error) {
+            console.error(`Error loading ${key}:`, error);
+            return null;
+        }
+    }
+
+    saveObject(key, obj) {
+        try {
+            localStorage.setItem(key, JSON.stringify(obj || {}));
+        } catch (error) {
+            console.error(`Error saving ${key}:`, error);
+        }
+    }
+
     loadDownloadedFiles() {
         try {
             const saved = localStorage.getItem('rssParserDownloadedFiles');
@@ -200,10 +234,10 @@ class RSSParser {
         let hasAnyFiles = false;
         
         for (const [baseName, files] of brandFiles) {
-            // Filter files based on cutoff time if provided
-            const filteredFiles = cutoffTime 
-                ? files.filter(file => file.pubDate >= cutoffTime)
-                : files;
+            // Filter files based on cutoff time (if provided) and size bounds
+            const filteredFiles = files.filter(file =>
+                (!cutoffTime || file.pubDate >= cutoffTime) && this.fileWithinSizeBounds(file)
+            );
             
             // Skip if no files match the filter
             if (filteredFiles.length === 0) {
@@ -272,6 +306,42 @@ class RSSParser {
                 localStorage.setItem('rssParserDefaultUrl', urlInput.value);
             });
         }
+        
+        // Clear SABnzb history button
+        const clearSabnzbHistoryBtn = document.getElementById('clear-sabnzb-history-btn');
+        if (clearSabnzbHistoryBtn) {
+            clearSabnzbHistoryBtn.addEventListener('click', () => this.clearSabNZBHistory());
+        }
+        
+        // Scroll to top button
+        const scrollToTopBtn = document.getElementById('scroll-to-top-btn');
+        if (scrollToTopBtn) {
+            scrollToTopBtn.addEventListener('click', () => {
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            });
+            // Only show once the page is actually scrolled down a bit
+            const toggleScrollBtn = () => {
+                scrollToTopBtn.classList.toggle('visible', window.scrollY > 300);
+            };
+            window.addEventListener('scroll', toggleScrollBtn, { passive: true });
+            toggleScrollBtn();
+        }
+        
+        // Performer search
+        const performerSearchBtn = document.getElementById('performer-search-btn');
+        const performerSearchInput = document.getElementById('performer-search');
+        if (performerSearchBtn && performerSearchInput) {
+            performerSearchBtn.addEventListener('click', () => this.fetchPerformerSearch());
+            performerSearchInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') this.fetchPerformerSearch();
+            });
+        }
+        
+        // Restart server
+        const restartServerBtn = document.getElementById('restart-server-btn');
+        if (restartServerBtn) {
+            restartServerBtn.addEventListener('click', () => this.restartServer());
+        }
     }
     
     initializeSimpleTabs() {
@@ -323,6 +393,96 @@ class RSSParser {
                 this.applyTimeFilter();
             });
             console.log('Time filter ready');
+        }
+    }
+
+    initializeSizeFilter() {
+        const minEl = document.getElementById('size-min');
+        const maxEl = document.getElementById('size-max');
+        const unitEl = document.getElementById('size-unit');
+        const prefEl = document.getElementById('size-preferred');
+        const clearBtn = document.getElementById('size-filter-clear');
+        if (!minEl || !maxEl || !unitEl) return;
+
+        const ONE_GB = 1024 * 1024 * 1024;
+
+        // Restore saved values
+        const saved = this.loadObject('rssParserSizeFilter');
+        if (saved && typeof saved === 'object') {
+            if (saved.min != null) minEl.value = saved.min;
+            if (saved.max != null) maxEl.value = saved.max;
+            if (saved.unit) unitEl.value = saved.unit;
+            if (prefEl && saved.preferred != null) prefEl.value = saved.preferred;
+        }
+
+        const apply = () => {
+            const unitBytes = unitEl.value === 'MB' ? 1024 * 1024 : ONE_GB;
+            const min = parseFloat(minEl.value);
+            const max = parseFloat(maxEl.value);
+            const pref = prefEl ? parseFloat(prefEl.value) : NaN;
+            this.minSizeBytes = (!isNaN(min) && min > 0) ? min * unitBytes : 0;
+            this.maxSizeBytes = (!isNaN(max) && max > 0) ? max * unitBytes : 0;
+            // Blank preferred falls back to 1 GB (original behaviour)
+            this.preferredSizeBytes = (!isNaN(pref) && pref > 0) ? pref * unitBytes : ONE_GB;
+
+            this.saveObject('rssParserSizeFilter', {
+                min: minEl.value, max: maxEl.value, unit: unitEl.value,
+                preferred: prefEl ? prefEl.value : ''
+            });
+            this.updateSizeFilterInfo();
+            if (this.brands.size > 0) this.displayResults();
+        };
+
+        minEl.addEventListener('input', apply);
+        maxEl.addEventListener('input', apply);
+        unitEl.addEventListener('change', apply);
+        if (prefEl) prefEl.addEventListener('input', apply);
+        if (clearBtn) {
+            clearBtn.addEventListener('click', () => {
+                minEl.value = '';
+                maxEl.value = '';
+                if (prefEl) prefEl.value = '';
+                apply();
+            });
+        }
+
+        // Apply restored values on load
+        apply();
+    }
+
+    updateSizeFilterInfo() {
+        const info = document.getElementById('size-filter-info');
+        if (!info) return;
+        const fmt = b => this.formatBytes(b);
+        if (this.minSizeBytes > 0 && this.maxSizeBytes > 0) {
+            info.textContent = `Showing ${fmt(this.minSizeBytes)} – ${fmt(this.maxSizeBytes)}`;
+        } else if (this.minSizeBytes > 0) {
+            info.textContent = `Showing ≥ ${fmt(this.minSizeBytes)}`;
+        } else if (this.maxSizeBytes > 0) {
+            info.textContent = `Showing ≤ ${fmt(this.maxSizeBytes)}`;
+        } else {
+            info.textContent = 'Showing all sizes';
+        }
+    }
+
+    // True if a file's size is within the active min/max bounds. Files with an
+    // unparseable/unknown size (0 bytes) are never hidden by the size filter.
+    fileWithinSizeBounds(file) {
+        const bytes = this.parseSizeToBytes(file && file.size);
+        if (bytes <= 0) return true;
+        if (this.minSizeBytes > 0 && bytes < this.minSizeBytes) return false;
+        if (this.maxSizeBytes > 0 && bytes > this.maxSizeBytes) return false;
+        return true;
+    }
+
+    initializeHideFullyReviewed() {
+        const checkbox = document.getElementById('hide-fully-reviewed');
+        if (checkbox) {
+            checkbox.addEventListener('change', () => {
+                if (this.brands.size > 0) {
+                    this.displayResults();
+                }
+            });
         }
     }
     
@@ -593,6 +753,448 @@ class RSSParser {
         this.hideUrlDropdown();
     }
 
+    async restartServer() {
+        const btn = document.getElementById('restart-server-btn');
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = 'Restarting…';
+        }
+        try {
+            const res = await fetch('/api/restart', { method: 'POST' });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                throw new Error(data.error || res.statusText || 'Restart failed');
+            }
+            setTimeout(() => {
+                window.location.reload();
+            }, 3500);
+        } catch (err) {
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Restart server';
+            }
+            alert('Restart: ' + err.message);
+        }
+    }
+
+    /**
+     * Parse Newznab/NZBGeek API JSON response into our file format and populate brands.
+     * Handles channel.item[] or item[] and various attr formats for size.
+     */
+    parseSearchAPIResponse(data) {
+        const items = (data && data.channel && data.channel.item) ? data.channel.item : (Array.isArray(data.item) ? data.item : []);
+        if (!Array.isArray(items) || items.length === 0) {
+            return;
+        }
+        this.brands.clear();
+        this.excludedFiles = [];
+        items.forEach(item => {
+            const fileInfo = this.extractFileInfoFromSearchItem(item);
+            if (fileInfo) {
+                if (this.isFileExcluded(fileInfo.name)) {
+                    this.excludedFiles.push(fileInfo);
+                    return;
+                }
+                if (!this.brands.has(fileInfo.brand)) {
+                    this.brands.set(fileInfo.brand, new Map());
+                }
+                const brandFiles = this.brands.get(fileInfo.brand);
+                const groupKey = this.getBaseNameGroupKey(fileInfo.baseName);
+                if (!brandFiles.has(groupKey)) {
+                    brandFiles.set(groupKey, []);
+                }
+                brandFiles.get(groupKey).push(fileInfo);
+            }
+        });
+    }
+
+    extractFileInfoFromSearchItem(item) {
+        const title = item.title || item.name || '';
+        if (!title) return null;
+        let link = item.link || '';
+        const enc = item.enclosure;
+        if (!link && enc) {
+            link = (enc['@attributes'] && enc['@attributes'].url) ? enc['@attributes'].url : (enc.url || '');
+        }
+        if (!link && item.guid) {
+            link = typeof item.guid === 'string' ? item.guid : (item.guid['#text'] || item.guid.value || '');
+        }
+        const pubDate = item.pubDate ? new Date(item.pubDate) : new Date();
+        let size = '';
+        const attrs = item.attr || item.attributes || item['newznab:attr'] || [];
+        const attrList = Array.isArray(attrs) ? attrs : [];
+        for (const a of attrList) {
+            const name = (a['@attributes'] && a['@attributes'].name) ? a['@attributes'].name : a.name;
+            const value = (a['@attributes'] && a['@attributes'].value) != null ? a['@attributes'].value : a.value;
+            if (name === 'size' && value != null) {
+                const bytes = parseInt(value, 10);
+                if (!isNaN(bytes)) size = this.formatBytes(bytes);
+                break;
+            }
+        }
+        if (!size && item.size != null) {
+            const bytes = parseInt(item.size, 10);
+            if (!isNaN(bytes)) size = this.formatBytes(bytes);
+        }
+        const brand = this.extractBrand(title);
+        const baseName = this.extractBaseName(title);
+        return {
+            name: title,
+            brand,
+            baseName,
+            link,
+            size,
+            pubDate,
+            timeAgo: this.getTimeAgo(pubDate)
+        };
+    }
+
+    async fetchPerformerSearch(term) {
+        const input = document.getElementById('performer-search');
+        // A term passed in (e.g. from a favourite/keyword chip) takes priority
+        // over whatever is typed in the box.
+        const raw = (typeof term === 'string' && term.trim())
+            ? term.trim()
+            : (input && input.value ? input.value.trim() : '');
+        const q = raw.replace(/\./g, ' ');
+        if (!q) {
+            alert('Enter a performer name to search.');
+            return;
+        }
+        // Reflect the chosen term in the search box for visibility
+        if (input) input.value = raw;
+        const btn = document.getElementById('performer-search-btn');
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = 'Searching…';
+        }
+        try {
+            const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                const msg = data.error || data.message || res.statusText || 'Search failed';
+                throw new Error(msg);
+            }
+            this.parseSearchAPIResponse(data);
+            if (this.brands.size === 0) {
+                alert('No results found.');
+            } else {
+                const saveTermEl = document.getElementById('save-search-term');
+                if (raw && (!saveTermEl || saveTermEl.checked)) {
+                    this.addKeyword(raw);
+                }
+                this.displayResults();
+                const resultsTab = document.querySelector('.tab-btn[data-tab="results"]');
+                if (resultsTab && !resultsTab.classList.contains('active')) {
+                    resultsTab.click();
+                }
+            }
+        } catch (err) {
+            alert('Search: ' + err.message);
+        } finally {
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Search';
+            }
+        }
+    }
+
+    async fetchSabNZBStatus() {
+        try {
+            const res = await fetch('/api/sabnzb/status');
+            const data = await res.json();
+            this.sabnzbConfigured = !!data.configured;
+            const clearHistoryBtn = document.getElementById('clear-sabnzb-history-btn');
+            if (clearHistoryBtn) {
+                clearHistoryBtn.style.display = this.sabnzbConfigured ? '' : 'none';
+            }
+            if (this.sabnzbConfigured && this.brands.size > 0) {
+                this.displayResults();
+            }
+        } catch (e) {
+            this.sabnzbConfigured = false;
+        }
+    }
+
+    async sendToSabNZB(fileLink, fileName) {
+        const nzbname = this.ensureFilenameHasXXX(fileName);
+        const res = await fetch('/api/sabnzb/add', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ nzbUrl: fileLink, nzbname })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) {
+            throw new Error(data.error || res.statusText || 'Failed to add to SabNZB');
+        }
+    }
+
+    // Update every button/row for this file (across all tabs) to the downloaded
+    // state, plus its same-baseName siblings. Call updateBrandDownloadStatus()
+    // separately (once per batch) to refresh the brand headers.
+    markFileDownloadedInDOM(fileLink, fileName) {
+        const allSabBtns = document.querySelectorAll(`.sabnzb-btn[data-file-link="${CSS.escape(fileLink)}"]`);
+        allSabBtns.forEach(btn => {
+            btn.disabled = true;
+            btn.classList.add('downloaded');
+            btn.classList.remove('sibling-downloaded');
+            btn.textContent = '✓ Sent to SabNZB';
+        });
+        const allMatchingButtons = document.querySelectorAll(`.download-btn[data-file-link="${CSS.escape(fileLink)}"]`);
+        allMatchingButtons.forEach(btn => {
+            btn.classList.add('downloaded');
+            btn.classList.remove('sibling-downloaded');
+            btn.textContent = '✓ Downloaded';
+            const fileItem = btn.closest('.file-item');
+            if (fileItem) {
+                fileItem.classList.add('downloaded');
+                fileItem.classList.remove('sibling-downloaded');
+            }
+        });
+        const baseName = this.extractBaseName(fileName);
+        this.updateSiblingDownloadStatus(baseName, fileLink);
+    }
+
+    async handleSabNZBClick(buttonElement, fileLink, fileName) {
+        buttonElement.disabled = true;
+        buttonElement.textContent = 'Sending…';
+        try {
+            await this.sendToSabNZB(fileLink, fileName);
+            this.markFileAsDownloaded(fileLink, fileName);
+            this.markFileDownloadedInDOM(fileLink, fileName);
+            this.updateBrandDownloadStatus();
+        } catch (err) {
+            buttonElement.disabled = false;
+            buttonElement.textContent = 'Send to SabNZB';
+            alert('SabNZB: ' + err.message);
+        }
+    }
+
+    /**
+     * Pick one file per baseName group in a brand: the version closest to the
+     * preferred size when a group has several sizes. Groups already downloaded,
+     * ignored, or with a downloaded/ignored sibling are skipped, as are files
+     * outside the active time/size filters.
+     */
+    getPreferredFilesForBrand(brandFiles, cutoffTime = null) {
+        const selections = [];
+        brandFiles.forEach((files, groupKey) => {
+            const filteredFiles = files.filter(file =>
+                (!cutoffTime || file.pubDate >= cutoffTime) && this.fileWithinSizeBounds(file)
+            );
+            if (filteredFiles.length === 0) return;
+
+            const baseName = filteredFiles[0].baseName || groupKey;
+            const hasDownload = filteredFiles.some(file => this.isFileDownloaded(file.link)) ||
+                this.hasSiblingDownloaded(baseName);
+            const allIgnored = filteredFiles.every(file => this.isFileIgnored(file.link)) ||
+                this.hasSiblingIgnored(baseName);
+            if (hasDownload || allIgnored) return;
+
+            // Newest first so the fallback (no parseable sizes) takes the latest file
+            filteredFiles.sort((a, b) => b.pubDate - a.pubDate);
+            let index = this.getPreferredSizeIndex(filteredFiles, this.preferredSizeBytes);
+            if (index < 0) index = 0;
+            selections.push(filteredFiles[index]);
+        });
+        return selections;
+    }
+
+    triggerBrowserDownload(file) {
+        const correctedFilename = this.ensureFilenameHasXXX(file.name);
+        const proxyDownloadUrl = `/proxy/download?url=${encodeURIComponent(file.link)}&filename=${encodeURIComponent(correctedFilename)}`;
+        const a = document.createElement('a');
+        a.href = proxyDownloadUrl;
+        a.download = correctedFilename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    }
+
+    async downloadWholeBrand(brandName, buttonElement) {
+        const brandFiles = this.brands.get(brandName);
+        if (!brandFiles) return;
+
+        const cutoffTime = this.timeFilter > 0
+            ? new Date(Date.now() - (this.timeFilter * 60 * 60 * 1000))
+            : null;
+        const selections = this.getPreferredFilesForBrand(brandFiles, cutoffTime);
+
+        if (selections.length === 0) {
+            alert(`${brandName}: nothing left to download — every group is already downloaded, ignored, or filtered out.`);
+            return;
+        }
+
+        // Newest first, so a file-count limit keeps the most recent releases
+        selections.sort((a, b) => b.pubDate - a.pubDate);
+
+        const via = this.sabnzbConfigured ? 'SabNZB' : 'browser download';
+        const chosen = await this.showBrandDownloadConfirm(brandName, selections, via);
+        if (!chosen || chosen.length === 0) return;
+
+        buttonElement.disabled = true;
+        const originalText = buttonElement.textContent;
+        let sent = 0;
+        const failures = [];
+
+        for (const file of chosen) {
+            buttonElement.textContent = `${sent + 1}/${chosen.length}…`;
+            try {
+                if (this.sabnzbConfigured) {
+                    await this.sendToSabNZB(file.link, file.name);
+                } else {
+                    this.triggerBrowserDownload(file);
+                    // Brief pause so the browser doesn't drop rapid-fire downloads
+                    await new Promise(resolve => setTimeout(resolve, 400));
+                }
+                this.markFileAsDownloaded(file.link, file.name);
+                this.markFileDownloadedInDOM(file.link, file.name);
+                sent++;
+            } catch (err) {
+                failures.push(`${file.name}: ${err.message}`);
+            }
+        }
+
+        this.updateBrandDownloadStatus();
+        buttonElement.disabled = false;
+        buttonElement.textContent = sent > 0 ? `✓ ${sent} sent` : originalText;
+        if (failures.length > 0) {
+            alert(`${failures.length} of ${chosen.length} failed:\n\n${failures.join('\n')}`);
+        }
+    }
+
+    /**
+     * Styled confirmation dialog for a whole-brand download. Shows file count,
+     * total size, and a scrollable file list, with a limit control to download
+     * only the newest N. Resolves with the chosen files, or null on cancel.
+     */
+    showBrandDownloadConfirm(brandName, selections, via) {
+        return new Promise(resolve => {
+            const summaryFor = (files) => {
+                let totalBytes = 0;
+                let unknownCount = 0;
+                files.forEach(file => {
+                    const bytes = this.parseSizeToBytes(file.size);
+                    if (bytes > 0) totalBytes += bytes;
+                    else unknownCount++;
+                });
+                let sizeSummary = totalBytes > 0 ? this.formatBytes(totalBytes) : 'size unknown';
+                if (totalBytes > 0 && unknownCount > 0) {
+                    sizeSummary += ` + ${unknownCount} unknown`;
+                }
+                return sizeSummary;
+            };
+
+            const rows = selections.map((file, i) => `
+                <li class="bdc-file" data-index="${i}">
+                    <span class="bdc-file-name">${this.escapeHtml(file.name)}</span>
+                    <span class="bdc-file-size">${this.escapeHtml(file.size || '?')}</span>
+                </li>
+            `).join('');
+
+            const limitControl = selections.length > 1 ? `
+                <div class="bdc-limit">
+                    <label for="bdc-limit-input">Limit to newest</label>
+                    <input type="number" id="bdc-limit-input" min="1" max="${selections.length}" step="1" value="${selections.length}">
+                    <span class="bdc-limit-of">of ${selections.length}</span>
+                </div>
+            ` : '';
+
+            const overlay = document.createElement('div');
+            overlay.className = 'bdc-overlay';
+            overlay.innerHTML = `
+                <div class="bdc-dialog" role="dialog" aria-modal="true" aria-labelledby="bdc-title">
+                    <h3 id="bdc-title">Download ${this.escapeHtml(brandName)}</h3>
+                    <div class="bdc-summary">
+                        <div class="bdc-stat">
+                            <span class="bdc-stat-value" id="bdc-count"></span>
+                            <span class="bdc-stat-label">files</span>
+                        </div>
+                        <div class="bdc-stat">
+                            <span class="bdc-stat-value" id="bdc-size"></span>
+                            <span class="bdc-stat-label">total</span>
+                        </div>
+                        <div class="bdc-stat">
+                            <span class="bdc-stat-value">${this.escapeHtml(via)}</span>
+                            <span class="bdc-stat-label">via</span>
+                        </div>
+                    </div>
+                    ${limitControl}
+                    <ul class="bdc-file-list">${rows}</ul>
+                    <div class="bdc-actions">
+                        <button type="button" class="bdc-cancel-btn">Cancel</button>
+                        <button type="button" class="bdc-confirm-btn"></button>
+                    </div>
+                </div>
+            `;
+
+            const limitInput = overlay.querySelector('#bdc-limit-input');
+            const confirmBtn = overlay.querySelector('.bdc-confirm-btn');
+
+            const currentLimit = () => {
+                if (!limitInput) return selections.length;
+                const n = parseInt(limitInput.value, 10);
+                if (isNaN(n) || n < 1) return selections.length;
+                return Math.min(n, selections.length);
+            };
+
+            const refresh = () => {
+                const limit = currentLimit();
+                const included = selections.slice(0, limit);
+                overlay.querySelector('#bdc-count').textContent = limit;
+                overlay.querySelector('#bdc-size').textContent = summaryFor(included);
+                confirmBtn.textContent = `⬇ Download ${limit} ${limit !== 1 ? 'files' : 'file'}`;
+                overlay.querySelectorAll('.bdc-file').forEach(row => {
+                    const i = parseInt(row.getAttribute('data-index'), 10);
+                    row.classList.toggle('bdc-excluded', i >= limit);
+                });
+            };
+
+            const close = (result) => {
+                document.removeEventListener('keydown', onKeydown);
+                overlay.remove();
+                resolve(result);
+            };
+            const onKeydown = (e) => {
+                if (e.key === 'Escape') close(null);
+            };
+
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) close(null);
+            });
+            overlay.querySelector('.bdc-cancel-btn').addEventListener('click', () => close(null));
+            confirmBtn.addEventListener('click', () => close(selections.slice(0, currentLimit())));
+            if (limitInput) limitInput.addEventListener('input', refresh);
+            document.addEventListener('keydown', onKeydown);
+
+            refresh();
+            document.body.appendChild(overlay);
+            confirmBtn.focus();
+        });
+    }
+
+    async clearSabNZBHistory() {
+        const btn = document.getElementById('clear-sabnzb-history-btn');
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = 'Clearing…';
+        }
+        try {
+            const res = await fetch('/api/sabnzb/history/clear', { method: 'POST' });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.ok) {
+                throw new Error(data.error || res.statusText || 'Failed to clear history');
+            }
+        } catch (err) {
+            alert('SabNZB: ' + err.message);
+        } finally {
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Clear SABnzb history';
+            }
+        }
+    }
+
     async fetchRSS() {
         console.log('=== fetchRSS called ===');
         const rssUrl = document.getElementById('rss-url').value.trim();
@@ -841,6 +1443,41 @@ class RSSParser {
         return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
     }
     
+    /** Parse size string (e.g. "1.19 GB", "210.17 MB") to bytes for comparison. Returns 0 if unparseable. */
+    parseSizeToBytes(sizeStr) {
+        if (!sizeStr || typeof sizeStr !== 'string') return 0;
+        const m = sizeStr.trim().match(/^([\d.]+)\s*(\w+)/i);
+        if (!m) return 0;
+        const n = parseFloat(m[1]);
+        if (isNaN(n)) return 0;
+        const unit = (m[2] || '').toUpperCase();
+        const k = 1024;
+        if (unit.startsWith('T')) return n * k * k * k * k;
+        if (unit.startsWith('G')) return n * k * k * k;
+        if (unit.startsWith('M')) return n * k * k;
+        if (unit.startsWith('K')) return n * k;
+        return n;
+    }
+    
+    /** Index in the files array whose size is closest to targetBytes (e.g. 1GB). */
+    getPreferredSizeIndex(files, targetBytes) {
+        if (!files.length) return -1;
+        let bestIndex = -1;
+        let bestDiff = Infinity;
+        const ONE_GB = 1024 * 1024 * 1024;
+        const target = targetBytes ?? ONE_GB;
+        files.forEach((file, i) => {
+            const bytes = this.parseSizeToBytes(file.size);
+            if (bytes <= 0) return;
+            const diff = Math.abs(bytes - target);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestIndex = i;
+            }
+        });
+        return bestIndex;
+    }
+    
     escapeHtml(unsafe) {
         return unsafe
             .replace(/&/g, "&amp;")
@@ -862,19 +1499,26 @@ class RSSParser {
             : null;
         
         // Update stats (count filtered files if filter is active)
+        const hideFullyReviewed = document.getElementById('hide-fully-reviewed')?.checked === true;
         let totalFiles = 0;
         let totalBrands = 0;
         let latestDate = null;
         
-        this.brands.forEach(brandFiles => {
+        this.brands.forEach((brandFiles, brandName) => {
+            if (hideFullyReviewed && this.isBrandFullyDownloaded(brandFiles, cutoffTime)) {
+                return;
+            }
             let brandHasFiles = false;
             brandFiles.forEach(files => {
                 files.forEach(file => {
-                    // Apply time filter if active
+                    // Apply time + size filters if active
                     if (cutoffTime && file.pubDate < cutoffTime) {
                         return;
                     }
-                    
+                    if (!this.fileWithinSizeBounds(file)) {
+                        return;
+                    }
+
                     totalFiles++;
                     brandHasFiles = true;
                     
@@ -925,11 +1569,14 @@ class RSSParser {
         
         // Sort brands by name
         const sortedBrands = Array.from(this.brands.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+        const hideFullyReviewed = document.getElementById('hide-fully-reviewed')?.checked === true;
 
         sortedBrands.forEach(([brandName, brandFiles]) => {
             const isFavorite = this.favoriteBrands.includes(brandName);
             const isAntiFavorite = this.antiFavoriteBrands.includes(brandName);
-            
+            const isExcluded = this.excludeKeywords.map(k => k.toLowerCase()).includes(brandName.toLowerCase());
+            const isHighlighted = this.keywords.map(k => k.toLowerCase()).includes(brandName.toLowerCase());
+
             // Generate filtered files HTML
             const filesHTML = this.generateBrandFilesHTML(brandFiles, cutoffTime);
             
@@ -940,13 +1587,19 @@ class RSSParser {
             
             // Check if all content in this brand has been downloaded
             const isFullyDownloaded = this.isBrandFullyDownloaded(brandFiles, cutoffTime);
+            if (hideFullyReviewed && isFullyDownloaded) {
+                return;
+            }
             
             // Get latest file date for this brand (from filtered files)
             let brandLatestDate = null;
             brandFiles.forEach(files => {
                 files.forEach(file => {
-                    // Only consider files that pass the time filter
+                    // Only consider files that pass the time + size filters
                     if (cutoffTime && file.pubDate < cutoffTime) {
+                        return;
+                    }
+                    if (!this.fileWithinSizeBounds(file)) {
                         return;
                     }
                     if (!brandLatestDate || file.pubDate > brandLatestDate) {
@@ -974,7 +1627,9 @@ class RSSParser {
                             <button class="anti-favorite-btn ${isAntiFavorite ? 'active' : ''}" data-action="anti-favorite" data-brand="${this.escapeHtml(brandName)}">
                                 ${isAntiFavorite ? '✖' : '○'}
                             </button>
-                            <button class="exclude-brand-btn ${this.excludeKeywords.map(k => k.toLowerCase()).includes(brandName.toLowerCase()) ? 'active' : ''}" data-action="exclude-brand" data-brand="${this.escapeHtml(brandName)}" title="Add brand to exclude list">Exclude</button>
+                            <button class="highlight-brand-btn ${isHighlighted ? 'active' : ''}" data-action="highlight-brand" data-brand="${this.escapeHtml(brandName)}" title="${isHighlighted ? 'Remove highlight keyword' : 'Add brand as highlight keyword'}">+HL</button>
+                            <button class="exclude-brand-btn ${isExcluded ? 'active' : ''}" data-action="exclude-brand" data-brand="${this.escapeHtml(brandName)}" title="${isExcluded ? 'Remove brand from exclude list' : 'Add brand to exclude list'}">Exclude</button>
+                            <button class="download-brand-btn" data-action="download-brand" data-brand="${this.escapeHtml(brandName)}" title="Download the whole brand — preferred size per group">⬇ All</button>
                             <button class="expand-btn" data-action="expand" data-brand="${this.escapeHtml(brandName)}">▼</button>
                         </div>
                     </div>
@@ -1009,6 +1664,16 @@ class RSSParser {
                 return;
             }
             
+            // Handle Send to SabNZB button clicks
+            if (target.classList.contains('sabnzb-btn')) {
+                const fileLink = target.getAttribute('data-file-link');
+                const fileName = target.getAttribute('data-file-name');
+                if (fileLink && fileName) {
+                    this.handleSabNZBClick(target, fileLink, fileName);
+                }
+                return;
+            }
+            
             // Handle ignore button clicks
             if (target.classList.contains('ignore-btn')) {
                 const fileLink = target.getAttribute('data-file-link');
@@ -1035,16 +1700,59 @@ class RSSParser {
                     // Pass the clicked button so we can find the correct brand item
                     this.toggleBrandExpansion(brandName, button);
                     break;
+                case 'download-brand':
+                    this.downloadWholeBrand(brandName, button);
+                    break;
                 case 'favorite':
                     this.toggleFavorite(brandName);
                     break;
                 case 'anti-favorite':
                     this.toggleAntiFavorite(brandName);
                     break;
-                case 'exclude-brand':
-                    this.addExcludeKeyword(this.normalizeBrandName(brandName));
-                    this.displayResults();
+                case 'exclude-brand': {
+                    // Toggle the brand's exclusion on/off so an accidental
+                    // click can be undone by clicking again. Update the button
+                    // in place so the list doesn't jump or collapse.
+                    const keyword = this.normalizeBrandName(brandName);
+                    const existingIndex = this.excludeKeywords.findIndex(
+                        k => k.toLowerCase() === keyword.toLowerCase()
+                    );
+                    if (existingIndex !== -1) {
+                        // Toggle OFF — remove from exclude list
+                        this.excludeKeywords.splice(existingIndex, 1);
+                        this.saveArray('rssParserExcludeKeywords', this.excludeKeywords);
+                        this.displayFavoritesAndKeywords();
+                        button.classList.remove('active');
+                        button.title = 'Add brand to exclude list';
+                    } else {
+                        // Toggle ON — add to exclude list
+                        this.addExcludeKeyword(keyword);
+                        button.classList.add('active');
+                        button.title = 'Remove brand from exclude list';
+                    }
                     break;
+                }
+                case 'highlight-brand': {
+                    // Toggle the brand as a highlight keyword, in place, so an
+                    // accidental click can be undone without collapsing the list.
+                    const existingIndex = this.keywords.findIndex(
+                        k => k.toLowerCase() === brandName.toLowerCase()
+                    );
+                    if (existingIndex !== -1) {
+                        // Toggle OFF — remove highlight keyword
+                        this.keywords.splice(existingIndex, 1);
+                        this.saveArray('rssParserKeywords', this.keywords);
+                        this.displayFavoritesAndKeywords();
+                        button.classList.remove('active');
+                        button.title = 'Add brand as highlight keyword';
+                    } else {
+                        // Toggle ON — add as highlight keyword (also applies highlighting)
+                        this.addKeyword(brandName);
+                        button.classList.add('active');
+                        button.title = 'Remove highlight keyword';
+                    }
+                    break;
+                }
             }
         };
         
@@ -1104,6 +1812,10 @@ class RSSParser {
                     fileItem.classList.remove('ignored');
                 }
             });
+            
+            // Re-evaluate sibling-ignored state for other files in the same group
+            const baseName = this.extractBaseName(fileName);
+            this.updateSiblingIgnoreStatus(baseName);
         } else {
             // Ignore the file
             this.markFileAsIgnored(fileLink, fileName);
@@ -1120,10 +1832,66 @@ class RSSParser {
                     fileItem.classList.add('ignored');
                 }
             });
+            
+            // Update sibling files (same baseName, different size/quality) to show as sibling-ignored
+            const baseName = this.extractBaseName(fileName);
+            this.updateSiblingIgnoreStatus(baseName);
         }
         
         // Update fully-downloaded status for affected brands
         this.updateBrandDownloadStatus();
+    }
+    
+    updateSiblingIgnoreStatus(baseName) {
+        const groupKey = this.getBaseNameGroupKey(baseName);
+        document.querySelectorAll('.ignore-btn').forEach(btn => {
+            const btnFileLink = btn.getAttribute('data-file-link');
+            const btnFileName = btn.getAttribute('data-file-name');
+            if (!btnFileName) return;
+            if (this.getBaseNameGroupKey(this.extractBaseName(btnFileName)) !== groupKey) return;
+            
+            const fileItem = btn.closest('.file-item');
+            if (this.isFileIgnored(btnFileLink)) {
+                btn.classList.add('ignored');
+                btn.classList.remove('sibling-ignored');
+                btn.textContent = '✓ Ignored';
+                if (fileItem) {
+                    fileItem.classList.add('ignored');
+                    fileItem.classList.remove('sibling-ignored');
+                }
+            } else if (this.hasSiblingIgnored(baseName)) {
+                btn.classList.remove('ignored');
+                btn.classList.add('sibling-ignored');
+                btn.textContent = '↳ Other Quality';
+                if (fileItem) {
+                    fileItem.classList.remove('ignored');
+                    fileItem.classList.add('sibling-ignored');
+                }
+            } else {
+                btn.classList.remove('ignored', 'sibling-ignored');
+                btn.textContent = 'Ignore';
+                if (fileItem) {
+                    fileItem.classList.remove('ignored', 'sibling-ignored');
+                }
+            }
+        });
+        // Also update download/SabNZB sibling state for same group (they may show "Other Quality" when sibling ignored)
+        document.querySelectorAll('.download-btn').forEach(btn => {
+            const btnFileLink = btn.getAttribute('data-file-link');
+            const btnFileName = btn.getAttribute('data-file-name');
+            if (!btnFileName || btn.classList.contains('downloaded')) return;
+            if (this.getBaseNameGroupKey(this.extractBaseName(btnFileName)) !== groupKey) return;
+            const fileItem = btn.closest('.file-item');
+            if (this.hasSiblingDownloaded(baseName)) {
+                btn.classList.add('sibling-downloaded');
+                btn.textContent = '↳ Other Quality';
+                if (fileItem) fileItem.classList.add('sibling-downloaded');
+            } else if (fileItem && fileItem.classList.contains('sibling-ignored')) {
+                btn.classList.remove('sibling-downloaded');
+                btn.textContent = 'Download NZB';
+                fileItem.classList.remove('sibling-downloaded');
+            }
+        });
     }
     
     updateSiblingDownloadStatus(baseName, excludeFileLink) {
@@ -1179,7 +1947,7 @@ class RSSParser {
                 }
             } else {
                 brandItem.classList.remove('fully-downloaded');
-                
+
                 // Remove badge if present
                 const badge = brandItem.querySelector('.fully-downloaded-badge');
                 if (badge) {
@@ -1187,6 +1955,9 @@ class RSSParser {
                 }
             }
         });
+
+        // Keyword badges depend on download state, so recompute them too
+        this.refreshBrandKeywordBadges();
     }
     
     setupDownloadEventDelegation(container) {
@@ -1210,6 +1981,17 @@ class RSSParser {
                 if (fileLink && fileName) {
                     this.handleIgnoreClick(target, fileLink, fileName);
                 }
+                return;
+            }
+            
+            // Handle Send to SabNZB button clicks
+            if (target.classList.contains('sabnzb-btn')) {
+                const fileLink = target.getAttribute('data-file-link');
+                const fileName = target.getAttribute('data-file-name');
+                if (fileLink && fileName) {
+                    this.handleSabNZBClick(target, fileLink, fileName);
+                }
+                return;
             }
         };
         
@@ -1234,10 +2016,10 @@ class RSSParser {
             // Sort files by date (newest first)
             files.sort((a, b) => b.pubDate - a.pubDate);
             
-            // Filter files based on cutoff time if provided
-            const filteredFiles = cutoffTime 
-                ? files.filter(file => file.pubDate >= cutoffTime)
-                : files;
+            // Filter files based on cutoff time (if provided) and size bounds
+            const filteredFiles = files.filter(file =>
+                (!cutoffTime || file.pubDate >= cutoffTime) && this.fileWithinSizeBounds(file)
+            );
             
             // Skip this group if no files match the filter
             if (filteredFiles.length === 0) {
@@ -1246,20 +2028,26 @@ class RSSParser {
             
             filteredFileCount += filteredFiles.length;
             
+            const preferredIndex = this.getPreferredSizeIndex(filteredFiles, this.preferredSizeBytes);
+            
             // Use first file's baseName for display (group key is lowercase for grouping only)
             const displayName = filteredFiles[0].baseName || baseName;
             html += `<div class="file-group">`;
             html += `<h4>${this.escapeHtml(displayName)} (${filteredFiles.length} versions)</h4>`;
             
-            filteredFiles.forEach(file => {
+            filteredFiles.forEach((file, fileIndex) => {
                 const ageClass = this.getAgeClass(file.pubDate);
                 const correctedFilename = this.ensureFilenameHasXXX(file.name);
                 const proxyDownloadUrl = `/proxy/download?url=${encodeURIComponent(file.link)}&filename=${encodeURIComponent(correctedFilename)}`;
                 const isDownloaded = this.isFileDownloaded(file.link);
                 const isIgnored = this.isFileIgnored(file.link);
-                const hasSiblingDownloaded = !isDownloaded && !isIgnored && this.hasSiblingDownloaded(baseName);
+                const hasSiblingIgnored = !isIgnored && this.hasSiblingIgnored(baseName);
+                const hasSiblingDownloaded = !isDownloaded && !isIgnored && !hasSiblingIgnored && this.hasSiblingDownloaded(baseName);
                 
                 let fileItemClass = ageClass;
+                if (fileIndex === preferredIndex) {
+                    fileItemClass += ' preferred-size';
+                }
                 let downloadBtnClass = 'download-btn';
                 let downloadBtnText = 'Download NZB';
                 let ignoreBtnClass = 'ignore-btn';
@@ -1273,11 +2061,30 @@ class RSSParser {
                     fileItemClass += ' ignored';
                     ignoreBtnClass = 'ignore-btn ignored';
                     ignoreBtnText = '✓ Ignored';
+                } else if (hasSiblingIgnored) {
+                    fileItemClass += ' sibling-ignored';
+                    ignoreBtnClass = 'ignore-btn sibling-ignored';
+                    ignoreBtnText = '↳ Other Quality';
                 } else if (hasSiblingDownloaded) {
                     fileItemClass += ' sibling-downloaded';
                     downloadBtnClass = 'download-btn sibling-downloaded';
                     downloadBtnText = '↳ Other Quality';
                 }
+                
+                const sabnzbBtnHtml = this.sabnzbConfigured
+                    ? (() => {
+                        let sabnzbClass = 'sabnzb-btn';
+                        let sabnzbText = 'Send to SabNZB';
+                        if (isDownloaded) {
+                            sabnzbClass += ' downloaded';
+                            sabnzbText = '✓ Sent to SabNZB';
+                        } else if (hasSiblingDownloaded || hasSiblingIgnored) {
+                            sabnzbClass += ' sibling-downloaded';
+                            sabnzbText = '↳ Other Quality';
+                        }
+                        return `<button type="button" class="${sabnzbClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}"${isDownloaded ? ' disabled' : ''}>${sabnzbText}</button>`;
+                    })()
+                    : '';
                 
                 html += `
                     <div class="file-item ${fileItemClass}">
@@ -1290,6 +2097,7 @@ class RSSParser {
                         </div>
                         <div class="file-actions">
                             <button class="${ignoreBtnClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">${ignoreBtnText}</button>
+                            ${sabnzbBtnHtml}
                             <a href="${proxyDownloadUrl}" class="${downloadBtnClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">${downloadBtnText}</a>
                         </div>
                     </div>
@@ -1356,7 +2164,7 @@ class RSSParser {
             console.log('Expanded brand:', brandName);
         }
     }
-    
+
     toggleFavorite(brandName) {
         const normalizedName = this.normalizeBrandName(brandName);
         const index = this.favoriteBrands.indexOf(normalizedName);
@@ -1500,7 +2308,9 @@ class RSSParser {
     }
     
     addKeyword(keyword) {
-        if (!this.keywords.includes(keyword)) {
+        // Case-insensitive dedupe so "Sophie Tyler" and "sophie tyler" can't both be added
+        const exists = this.keywords.some(k => k.toLowerCase() === keyword.toLowerCase());
+        if (!exists) {
             this.keywords.push(keyword);
             this.saveArray('rssParserKeywords', this.keywords);
             this.displayFavoritesAndKeywords();
@@ -1537,69 +2347,75 @@ class RSSParser {
     
     applyKeywordHighlighting() {
         if (!Array.isArray(this.keywords) || this.keywords.length === 0) return;
-        
-        // Track which brands have keyword matches
-        const brandsWithKeywords = new Set();
-        
+
         document.querySelectorAll('.file-name').forEach(element => {
+            const fileItem = element.closest('.file-item');
+            // Entries already dealt with (downloaded, or another quality of the
+            // same content downloaded) don't get keyword highlighting
+            if (fileItem && (fileItem.classList.contains('downloaded') ||
+                fileItem.classList.contains('sibling-downloaded'))) {
+                return;
+            }
+
             const text = element.textContent;
             let highlightedText = text;
-            let hasKeyword = false;
-            
+
             this.keywords.forEach(keyword => {
                 const regex = new RegExp(`(${keyword})`, 'gi');
-                if (regex.test(text)) {
-                    hasKeyword = true;
-                }
                 highlightedText = highlightedText.replace(regex, '<mark>$1</mark>');
             });
-            
+
             if (highlightedText !== text) {
                 element.innerHTML = highlightedText;
-                element.closest('.file-item').classList.add('highlighted');
-            }
-            
-            // If this file has a keyword, mark its brand
-            if (hasKeyword) {
-                const brandItem = element.closest('.brand-item');
-                if (brandItem) {
-                    const brandName = brandItem.getAttribute('data-brand');
-                    if (brandName) {
-                        brandsWithKeywords.add(brandName);
-                    }
-                }
+                if (fileItem) fileItem.classList.add('highlighted');
             }
         });
-        
-        // Highlight brand headers that contain keyword matches
-        brandsWithKeywords.forEach(brandName => {
-            const brandItem = document.querySelector(`.brand-item[data-brand="${brandName}"]`);
-            if (brandItem) {
+
+        this.refreshBrandKeywordBadges();
+    }
+
+    /**
+     * Brand-level keyword highlight and match badge. Only matches that are
+     * still actionable count — files already downloaded (or with another
+     * quality of the same content downloaded) are excluded, so a brand stops
+     * being highlighted once its keyword matches have been dealt with.
+     */
+    refreshBrandKeywordBadges() {
+        // Strip keyword marks from rows that have since been downloaded (or had
+        // another quality downloaded) so dealt-with entries stop drawing attention
+        document.querySelectorAll(
+            '.file-item.downloaded .file-name mark, .file-item.sibling-downloaded .file-name mark'
+        ).forEach(mark => {
+            mark.replaceWith(document.createTextNode(mark.textContent));
+        });
+        document.querySelectorAll(
+            '.file-item.highlighted.downloaded, .file-item.highlighted.sibling-downloaded'
+        ).forEach(item => item.classList.remove('highlighted'));
+
+        document.querySelectorAll('.brand-item').forEach(brandItem => {
+            const matchCount = brandItem.querySelectorAll(
+                '.file-item.highlighted:not(.downloaded):not(.sibling-downloaded)'
+            ).length;
+            const brandHeader = brandItem.querySelector('.brand-header');
+            let badge = brandHeader ? brandHeader.querySelector('.keyword-match-badge') : null;
+
+            if (matchCount > 0) {
                 brandItem.classList.add('has-keywords');
-                
-                // Count keyword matches in this brand
-                let matchCount = 0;
-                brandItem.querySelectorAll('.file-item.highlighted').forEach(() => {
-                    matchCount++;
-                });
-                
-                // Add badge to brand header if it doesn't already exist
-                const brandHeader = brandItem.querySelector('.brand-header');
-                if (brandHeader && matchCount > 0) {
-                    const existingBadge = brandHeader.querySelector('.keyword-match-badge');
-                    if (!existingBadge) {
-                        const badge = document.createElement('span');
-                        badge.className = 'keyword-match-badge';
-                        badge.textContent = `${matchCount} keyword match${matchCount !== 1 ? 'es' : ''}`;
-                        badge.title = 'This brand contains files matching your keywords';
-                        
-                        // Insert badge after brand name
-                        const brandControls = brandHeader.querySelector('.brand-controls');
-                        if (brandControls) {
-                            brandControls.insertBefore(badge, brandControls.firstChild);
-                        }
+                if (!badge && brandHeader) {
+                    badge = document.createElement('span');
+                    badge.className = 'keyword-match-badge';
+                    badge.title = 'This brand contains files matching your keywords';
+                    const brandControls = brandHeader.querySelector('.brand-controls');
+                    if (brandControls) {
+                        brandControls.insertBefore(badge, brandControls.firstChild);
                     }
                 }
+                if (badge) {
+                    badge.textContent = `${matchCount} keyword match${matchCount !== 1 ? 'es' : ''}`;
+                }
+            } else {
+                brandItem.classList.remove('has-keywords');
+                if (badge) badge.remove();
             }
         });
     }
@@ -1608,120 +2424,376 @@ class RSSParser {
         this.displayFavoriteBrands();
         this.displayKeywords();
         this.displayExcludeKeywords();
+        this.displayQuickSearchChips();
+    }
+
+    // Populate the collapsible "Quick search" panel with a chip per favourite
+    // brand and highlight keyword. The panel is hidden entirely when there is
+    // nothing to show, and stays collapsed until the user opens it.
+    displayQuickSearchChips() {
+        const wrapper = document.getElementById('quick-search');
+        const container = document.getElementById('quick-search-chips');
+        if (!wrapper || !container) return;
+
+        const favs = Array.isArray(this.favoriteBrands) ? this.favoriteBrands : [];
+        const kws = Array.isArray(this.keywords) ? this.keywords : [];
+        const total = favs.length + kws.length;
+
+        if (total === 0) {
+            wrapper.hidden = true;
+            container.innerHTML = '';
+            return;
+        }
+        wrapper.hidden = false;
+
+        const countEl = document.getElementById('quick-search-count');
+        if (countEl) countEl.textContent = `(${total})`;
+
+        const chip = (term, cls) =>
+            `<button type="button" class="search-chip ${cls}" data-term="${this.escapeHtml(term)}" title="Search for ${this.escapeHtml(term)}">${this.escapeHtml(term)}</button>`;
+
+        let html = '';
+        if (favs.length) {
+            html += `<div class="chip-row"><span class="chip-row-label">Favourites:</span>` +
+                favs.map(b => chip(b, 'fav-chip')).join('') + `</div>`;
+        }
+        if (kws.length) {
+            html += `<div class="chip-row"><span class="chip-row-label">Keywords:</span>` +
+                kws.map(k => chip(k, 'kw-chip')).join('') + `</div>`;
+        }
+        container.innerHTML = html;
+
+        container.querySelectorAll('.search-chip').forEach(el => {
+            el.addEventListener('click', () => {
+                this.fetchPerformerSearch(el.getAttribute('data-term'));
+            });
+        });
+    }
+
+    // Wire the Quick-search collapse toggle once; restores the last open/closed
+    // state from storage (collapsed by default).
+    initializeQuickSearchToggle() {
+        const toggle = document.getElementById('quick-search-toggle');
+        const container = document.getElementById('quick-search-chips');
+        const chevron = toggle ? toggle.querySelector('.qs-chevron') : null;
+        if (!toggle || !container) return;
+
+        const apply = (open) => {
+            container.hidden = !open;
+            toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+            if (chevron) chevron.textContent = open ? '▾' : '▸';
+        };
+
+        apply(localStorage.getItem('rssParserQuickSearchOpen') === '1');
+
+        toggle.addEventListener('click', () => {
+            const open = container.hidden; // about to open if currently hidden
+            apply(open);
+            localStorage.setItem('rssParserQuickSearchOpen', open ? '1' : '0');
+        });
     }
     
     displayFavoriteBrands() {
-        const container = document.getElementById('favorite-brands-list');
-        if (!container) return;
-        
-        if (this.favoriteBrands.length === 0) {
-            container.innerHTML = '<p>No favorite brands selected.</p>';
-            return;
-        }
-        
-        let html = '';
-        this.favoriteBrands.forEach((brand, index) => {
-            html += `
-                <span class="keyword-tag favorite-tag">
-                    ${this.escapeHtml(brand)}
-                    <button class="remove-tag-btn" data-type="favorite" data-index="${index}">×</button>
-                </span>
-            `;
-        });
-        
-        container.innerHTML = html;
-        
-        // Set up event delegation for remove buttons
-        container.querySelectorAll('.remove-tag-btn[data-type="favorite"]').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const index = parseInt(e.target.getAttribute('data-index'));
-                const brand = this.favoriteBrands[index];
-                if (brand) {
-                    this.removeFavoriteBrand(brand);
-                }
-            });
-        });
+        this.renderTagList('favorite-brands-list', 'favorite', 'No favorite brands selected.');
     }
-    
+
     displayKeywords() {
-        const container = document.getElementById('keywords-list');
-        if (!container) return;
-        
-        if (this.keywords.length === 0) {
-            container.innerHTML = '<p>No highlight keywords added.</p>';
-            return;
-        }
-        
-        let html = '';
-        this.keywords.forEach((keyword, index) => {
-            html += `
-                <span class="keyword-tag">
-                    ${this.escapeHtml(keyword)}
-                    <button class="remove-tag-btn" data-type="keyword" data-index="${index}">×</button>
-                </span>
-            `;
+        this.renderTagList('keywords-list', 'keyword', 'No highlight keywords added.');
+    }
+
+    displayExcludeKeywords() {
+        this.renderTagList('exclude-keywords-list', 'exclude', 'No exclude keywords added.');
+    }
+
+    // ---- Shared tag-list rendering & management (favourites / keywords / excludes) ----
+
+    _tagArrayFor(type) {
+        if (type === 'favorite') return this.favoriteBrands;
+        if (type === 'exclude') return this.excludeKeywords;
+        return this.keywords;
+    }
+
+    _tagStorageKeyFor(type) {
+        if (type === 'favorite') return 'rssParserFavoriteBrands';
+        if (type === 'exclude') return 'rssParserExcludeKeywords';
+        return 'rssParserKeywords';
+    }
+
+    _tagContainerIdFor(type) {
+        if (type === 'favorite') return 'favorite-brands-list';
+        if (type === 'exclude') return 'exclude-keywords-list';
+        return 'keywords-list';
+    }
+
+    // Wire the per-list search boxes and A→Z sort buttons in the management tab
+    initializeTagListTools() {
+        this.tagFilters = { favorite: '', keyword: '', exclude: '' };
+        this.tagSortDirection = {}; // per-type toggle between asc and desc
+
+        document.querySelectorAll('.tag-filter-input').forEach(input => {
+            input.addEventListener('input', () => {
+                const type = input.getAttribute('data-type');
+                this.tagFilters[type] = input.value.trim().toLowerCase();
+                this.applyTagFilter(type);
+            });
         });
-        
-        container.innerHTML = html;
-        
-        // Set up event delegation for remove buttons
-        container.querySelectorAll('.remove-tag-btn[data-type="keyword"]').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const index = parseInt(e.target.getAttribute('data-index'));
-                const keyword = this.keywords[index];
-                if (keyword) {
-                    this.removeKeyword(keyword);
-                }
+
+        document.querySelectorAll('.tag-sort-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const type = btn.getAttribute('data-type');
+                this.sortTagList(type);
+                btn.textContent = this.tagSortDirection[type] === 'desc' ? 'Z→A' : 'A→Z';
             });
         });
     }
-    
-    displayExcludeKeywords() {
-        const container = document.getElementById('exclude-keywords-list');
+
+    // Hide tags that don't match the list's search box. Visibility-only, so
+    // the data-index attributes (used by move/remove/rename) stay valid.
+    applyTagFilter(type) {
+        const container = document.getElementById(this._tagContainerIdFor(type));
         if (!container) return;
-        
-        if (this.excludeKeywords.length === 0) {
-            container.innerHTML = '<p>No exclude keywords added.</p>';
+
+        const filter = (this.tagFilters && this.tagFilters[type]) || '';
+        let visible = 0;
+        container.querySelectorAll('.keyword-tag').forEach(tag => {
+            const label = tag.querySelector('.tag-label')?.textContent.toLowerCase() || '';
+            const match = !filter || label.includes(filter);
+            tag.style.display = match ? '' : 'none';
+            if (match) visible++;
+        });
+
+        let emptyMsg = container.querySelector('.tag-filter-empty');
+        const hasTags = container.querySelector('.keyword-tag') !== null;
+        if (hasTags && visible === 0) {
+            if (!emptyMsg) {
+                emptyMsg = document.createElement('p');
+                emptyMsg.className = 'tag-filter-empty';
+                emptyMsg.textContent = 'No matches.';
+                container.appendChild(emptyMsg);
+            }
+        } else {
+            emptyMsg?.remove();
+        }
+    }
+
+    // Sort the list alphabetically; clicking again toggles the direction
+    sortTagList(type) {
+        const arr = this._tagArrayFor(type);
+        if (!Array.isArray(arr) || arr.length < 2) return;
+
+        const dir = this.tagSortDirection[type] === 'asc' ? 'desc' : 'asc';
+        this.tagSortDirection[type] = dir;
+        arr.sort((a, b) => dir === 'asc'
+            ? a.localeCompare(b, undefined, { sensitivity: 'base' })
+            : b.localeCompare(a, undefined, { sensitivity: 'base' }));
+
+        this.saveArray(this._tagStorageKeyFor(type), arr);
+        this.displayFavoritesAndKeywords();
+        if (type === 'keyword') this.applyKeywordHighlighting();
+        if (type === 'favorite' && this.brands.size > 0) this.displayResults();
+    }
+
+    renderTagList(containerId, type, emptyMsg) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+
+        const items = this._tagArrayFor(type);
+        if (!Array.isArray(items) || items.length === 0) {
+            container.innerHTML = `<p>${emptyMsg}</p>`;
             return;
         }
-        
-        let html = '';
-        this.excludeKeywords.forEach((keyword, index) => {
-            html += `
-                <span class="keyword-tag exclude-tag">
-                    ${this.escapeHtml(keyword)}
-                    <button class="remove-tag-btn" data-type="exclude" data-index="${index}">×</button>
+
+        const extraClass = type === 'favorite' ? 'favorite-tag' : (type === 'exclude' ? 'exclude-tag' : '');
+        const searchable = type !== 'exclude';
+
+        container.innerHTML = items.map((val, i) => `
+            <span class="keyword-tag ${extraClass}" data-index="${i}">
+                <span class="tag-order">
+                    <button class="tag-move-btn" data-dir="up" title="Move up" ${i === 0 ? 'disabled' : ''}>▲</button>
+                    <button class="tag-move-btn" data-dir="down" title="Move down" ${i === items.length - 1 ? 'disabled' : ''}>▼</button>
                 </span>
-            `;
-        });
-        
-        container.innerHTML = html;
-        
-        // Set up event delegation for remove buttons
-        container.querySelectorAll('.remove-tag-btn[data-type="exclude"]').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const index = parseInt(e.target.getAttribute('data-index'));
-                const keyword = this.excludeKeywords[index];
-                if (keyword) {
-                    this.removeExcludeKeyword(keyword);
-                }
+                ${searchable ? `<button class="search-tag-btn" data-term="${this.escapeHtml(val)}" title="Search for ${this.escapeHtml(val)}">🔍</button>` : ''}
+                <span class="tag-label" title="Click to rename">${this.escapeHtml(val)}</span>
+                <button class="remove-tag-btn" title="Remove">×</button>
+            </span>
+        `).join('');
+
+        container.querySelectorAll('.keyword-tag').forEach(tag => {
+            const i = parseInt(tag.getAttribute('data-index'), 10);
+            tag.querySelector('.remove-tag-btn')?.addEventListener('click', () => this.removeTagItem(type, i));
+            tag.querySelector('.search-tag-btn')?.addEventListener('click', () => {
+                const term = this._tagArrayFor(type)[i];
+                if (term) this.fetchPerformerSearch(term);
             });
+            tag.querySelectorAll('.tag-move-btn').forEach(btn =>
+                btn.addEventListener('click', () => this.moveTagItem(type, i, btn.getAttribute('data-dir')))
+            );
+            tag.querySelector('.tag-label')?.addEventListener('click', (e) => this.startTagRename(e.currentTarget, type, i));
         });
+
+        this.applyTagFilter(type);
+    }
+
+    removeTagItem(type, index) {
+        const val = this._tagArrayFor(type)[index];
+        if (val === undefined) return;
+        // Delegate to the existing removers so their side-effects run
+        if (type === 'favorite') this.removeFavoriteBrand(val);
+        else if (type === 'exclude') this.removeExcludeKeyword(val);
+        else this.removeKeyword(val);
+    }
+
+    moveTagItem(type, index, dir) {
+        const arr = this._tagArrayFor(type);
+        const j = dir === 'up' ? index - 1 : index + 1;
+        if (j < 0 || j >= arr.length) return;
+        [arr[index], arr[j]] = [arr[j], arr[index]];
+        this.saveArray(this._tagStorageKeyFor(type), arr);
+        this.displayFavoritesAndKeywords();
+        if (type === 'keyword') this.applyKeywordHighlighting();
+        if (type === 'favorite' && this.brands.size > 0) this.displayResults();
+    }
+
+    startTagRename(labelEl, type, index) {
+        const arr = this._tagArrayFor(type);
+        const current = arr[index];
+        if (current === undefined) return;
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'tag-edit-input';
+        input.value = current;
+        labelEl.replaceWith(input);
+        input.focus();
+        input.select();
+
+        let finished = false;
+        const commit = (save) => {
+            if (finished) return;
+            finished = true;
+            const val = input.value.trim();
+            const duplicate = arr.some((x, idx) => idx !== index && x.toLowerCase() === val.toLowerCase());
+            if (save && val && val.toLowerCase() !== current.toLowerCase() && !duplicate) {
+                arr[index] = type === 'favorite' ? this.normalizeBrandName(val) : val;
+                this.saveArray(this._tagStorageKeyFor(type), arr);
+                if (type === 'keyword') this.applyKeywordHighlighting();
+                if (type === 'favorite' && this.brands.size > 0) this.displayResults();
+            }
+            this.displayFavoritesAndKeywords();
+        };
+
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') commit(true);
+            else if (e.key === 'Escape') commit(false);
+        });
+        input.addEventListener('blur', () => commit(true));
     }
     
     displayFavorites() {
         console.log('displayFavorites called');
         console.log('Favorite brands:', this.favoriteBrands);
         console.log('Brands size:', this.brands.size);
-        
+
         // Display favorite brands
         this.displayFavoriteBrandsSection();
-        
+
         // Display keyword matches
         this.displayKeywordMatchesSection();
-        
+
         // Update stats
         this.updateFavoritesStats();
+
+        // Re-apply an active search after re-render
+        this.applyFavoritesSearch();
+    }
+
+    // Wire the Favorites tab search box and sort selector
+    initializeFavoritesTools() {
+        const searchInput = document.getElementById('favorites-search');
+        if (searchInput) {
+            searchInput.addEventListener('input', () => this.applyFavoritesSearch());
+        }
+
+        const sortSelect = document.getElementById('favorites-sort');
+        if (sortSelect) {
+            sortSelect.value = this.favoritesSortMode;
+            if (sortSelect.value !== this.favoritesSortMode) {
+                // Saved mode is no longer a valid option - fall back
+                this.favoritesSortMode = 'custom';
+                sortSelect.value = 'custom';
+            }
+            sortSelect.addEventListener('change', () => {
+                this.favoritesSortMode = sortSelect.value;
+                localStorage.setItem('rssParserFavoritesSort', this.favoritesSortMode);
+                this.displayFavorites();
+            });
+        }
+    }
+
+    // Order brand entries ({ name, latestDate, fileCount, cardHtml }) per the
+    // Favorites tab sort selector. "custom" keeps the caller's order (the
+    // user's favourites order / alphabetical for keyword matches).
+    sortFavoriteEntries(entries) {
+        const mode = this.favoritesSortMode || 'custom';
+        if (mode === 'custom') return entries;
+
+        return [...entries].sort((a, b) => {
+            if (mode === 'name-asc') return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+            if (mode === 'name-desc') return b.name.localeCompare(a.name, undefined, { sensitivity: 'base' });
+            if (mode === 'latest') return (b.latestDate ? b.latestDate.getTime() : 0) - (a.latestDate ? a.latestDate.getTime() : 0);
+            if (mode === 'files') return b.fileCount - a.fileCount;
+            return 0;
+        });
+    }
+
+    // Filter the rendered Favorites tab by brand or file name. Visibility-only,
+    // same approach as the Results tab search, but scoped to this tab. A brand
+    // name match shows all of that brand's files.
+    applyFavoritesSearch() {
+        const tab = document.getElementById('favorites-tab');
+        if (!tab) return;
+
+        const input = document.getElementById('favorites-search');
+        const status = document.getElementById('favorites-search-status');
+        const query = (input ? input.value : '').toLowerCase().trim();
+
+        let visibleBrands = 0;
+        let visibleFiles = 0;
+
+        tab.querySelectorAll('.brand-item').forEach(brandItem => {
+            const brandName = (brandItem.getAttribute('data-brand') || '').toLowerCase();
+            const brandNameMatch = !query || brandName.includes(query);
+            let brandHasMatch = false;
+
+            brandItem.querySelectorAll('.file-group').forEach(group => {
+                let groupHasMatch = false;
+                group.querySelectorAll('.file-item').forEach(fileItem => {
+                    const fileName = fileItem.querySelector('.file-name');
+                    const fileNameText = fileName ? fileName.textContent.toLowerCase() : '';
+                    const matches = brandNameMatch || fileNameText.includes(query);
+                    fileItem.style.display = matches ? 'flex' : 'none';
+                    if (matches) {
+                        groupHasMatch = true;
+                        visibleFiles++;
+                    }
+                });
+                group.style.display = groupHasMatch ? 'block' : 'none';
+                if (groupHasMatch) brandHasMatch = true;
+            });
+
+            brandItem.style.display = brandHasMatch ? 'block' : 'none';
+            if (brandHasMatch) visibleBrands++;
+        });
+
+        if (status) {
+            if (!query) {
+                status.textContent = '';
+            } else if (visibleFiles === 0) {
+                status.textContent = 'No matches found';
+            } else {
+                status.textContent = `${visibleFiles} file${visibleFiles !== 1 ? 's' : ''} in ${visibleBrands} brand${visibleBrands !== 1 ? 's' : ''}`;
+            }
+        }
     }
     
     displayFavoriteBrandsSection() {
@@ -1742,20 +2814,18 @@ class RSSParser {
             return;
         }
         
-        let html = '';
-        let foundCount = 0;
-        
+        const entries = [];
+
         this.favoriteBrands.forEach(brandName => {
             console.log(`Checking brand: ${brandName}, exists: ${this.brands.has(brandName)}`);
             if (this.brands.has(brandName)) {
-                foundCount++;
                 const brandFiles = this.brands.get(brandName);
                 const filesHTML = this.generateBrandFilesHTML(brandFiles);
                 console.log(`  Brand ${brandName} has ${filesHTML.filteredFileCount} files`);
-                
+
                 // Check if all content in this brand has been downloaded
                 const isFullyDownloaded = this.isBrandFullyDownloaded(brandFiles);
-                
+
                 // Get latest date for this brand
                 let latestDate = null;
                 brandFiles.forEach(files => {
@@ -1765,19 +2835,20 @@ class RSSParser {
                         }
                     });
                 });
-                
+
                 const brandClasses = [
                     'brand-item',
                     'favorite',
                     isFullyDownloaded ? 'fully-downloaded' : ''
                 ].filter(Boolean).join(' ');
-                
-                html += `
+
+                const cardHtml = `
                     <div class="${brandClasses}" data-brand="${this.escapeHtml(brandName)}">
                         <div class="brand-header">
                             <h3>${this.escapeHtml(brandName)} (${filesHTML.filteredFileCount} files)${isFullyDownloaded ? ' <span class="fully-downloaded-badge">✓ All Reviewed</span>' : ''}</h3>
                             <div class="brand-controls">
                                 <span class="brand-latest">${latestDate ? this.getTimeAgo(latestDate) : ''}</span>
+                                <button class="download-brand-btn" data-action="download-brand" data-brand="${this.escapeHtml(brandName)}" title="Download the whole brand — preferred size per group">⬇ All</button>
                                 <button class="expand-btn" data-action="expand" data-brand="${this.escapeHtml(brandName)}">▼</button>
                             </div>
                         </div>
@@ -1786,12 +2857,15 @@ class RSSParser {
                         </div>
                     </div>
                 `;
+                entries.push({ name: brandName, latestDate, fileCount: filesHTML.filteredFileCount, cardHtml });
             }
         });
-        
-        console.log(`Found ${foundCount} favorite brands with files`);
+
+        const html = this.sortFavoriteEntries(entries).map(e => e.cardHtml).join('');
+
+        console.log(`Found ${entries.length} favorite brands with files`);
         console.log('Generated HTML length:', html.length);
-        
+
         if (html === '') {
             container.innerHTML = '<p>None of your favorite brands have files in the current results.</p>';
         } else {
@@ -1844,64 +2918,64 @@ class RSSParser {
             return;
         }
         
-        // Sort by date (newest first)
-        matchingFiles.sort((a, b) => b.pubDate - a.pubDate);
-        
-        let html = '<div class="keyword-matches-list">';
-        
+        // Group by brand (parent category), then by baseName (file group) - same structure as results tab
+        const byBrand = new Map();
         matchingFiles.forEach(file => {
-            const ageClass = this.getAgeClass(file.pubDate);
-            const correctedFilename = this.ensureFilenameHasXXX(file.name);
-            const proxyDownloadUrl = `/proxy/download?url=${encodeURIComponent(file.link)}&filename=${encodeURIComponent(correctedFilename)}`;
-            const isDownloaded = this.isFileDownloaded(file.link);
-            const isIgnored = this.isFileIgnored(file.link);
-            const baseName = this.extractBaseName(file.name);
-            const hasSiblingDownloaded = !isDownloaded && !isIgnored && this.hasSiblingDownloaded(baseName);
-            
-            let fileItemClass = `${ageClass} keyword-match`;
-            let downloadBtnClass = 'download-btn';
-            let downloadBtnText = 'Download NZB';
-            let ignoreBtnClass = 'ignore-btn';
-            let ignoreBtnText = 'Ignore';
-            
-            if (isDownloaded) {
-                fileItemClass += ' downloaded';
-                downloadBtnClass = 'download-btn downloaded';
-                downloadBtnText = '✓ Downloaded';
-            } else if (isIgnored) {
-                fileItemClass += ' ignored';
-                ignoreBtnClass = 'ignore-btn ignored';
-                ignoreBtnText = '✓ Ignored';
-            } else if (hasSiblingDownloaded) {
-                fileItemClass += ' sibling-downloaded';
-                downloadBtnClass = 'download-btn sibling-downloaded';
-                downloadBtnText = '↳ Other Quality';
+            const brandName = file.brandName;
+            if (!byBrand.has(brandName)) {
+                byBrand.set(brandName, new Map());
             }
-            
-            html += `
-                <div class="file-item ${fileItemClass}">
-                    <div class="file-info">
-                        <span class="file-brand">[${this.escapeHtml(file.brandName)}]</span>
-                        <span class="file-name">${this.highlightKeywords(file.name)}</span>
-                        <div class="file-meta">
-                            <span class="file-size">${file.size}</span>
-                            <span class="file-age">${file.timeAgo}</span>
-                            <span class="matched-keywords">Keywords: ${file.matchedKeywords.join(', ')}</span>
+            const brandFiles = byBrand.get(brandName);
+            const groupKey = this.getBaseNameGroupKey(file.baseName || this.extractBaseName(file.name));
+            if (!brandFiles.has(groupKey)) {
+                brandFiles.set(groupKey, []);
+            }
+            brandFiles.get(groupKey).push(file);
+        });
+        
+        // Build brand cards with same structure as results tab (brand-item >
+        // brand-header > brand-files > file-groups). "Custom" sort falls back
+        // to alphabetical here since keyword matches have no manual order.
+        const sortedBrands = Array.from(byBrand.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+        const entries = [];
+
+        sortedBrands.forEach(([brandName, brandFiles]) => {
+            const filesHTML = this.generateBrandFilesHTML(brandFiles);
+            const isFullyDownloaded = this.isBrandFullyDownloaded(brandFiles);
+            let latestDate = null;
+            brandFiles.forEach(files => {
+                files.forEach(file => {
+                    if (!latestDate || file.pubDate > latestDate) {
+                        latestDate = file.pubDate;
+                    }
+                });
+            });
+
+            const brandClasses = [
+                'brand-item',
+                'keyword-matches-brand',
+                isFullyDownloaded ? 'fully-downloaded' : ''
+            ].filter(Boolean).join(' ');
+
+            const cardHtml = `
+                <div class="${brandClasses}" data-brand="${this.escapeHtml(brandName)}">
+                    <div class="brand-header">
+                        <h3>${this.escapeHtml(brandName)} (${filesHTML.filteredFileCount} files)${isFullyDownloaded ? ' <span class="fully-downloaded-badge">✓ All Reviewed</span>' : ''}</h3>
+                        <div class="brand-controls">
+                            <span class="brand-latest">${latestDate ? this.getTimeAgo(latestDate) : ''}</span>
+                            <button class="expand-btn" data-action="expand" data-brand="${this.escapeHtml(brandName)}">▼</button>
                         </div>
                     </div>
-                    <div class="file-actions">
-                        <button class="${ignoreBtnClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">${ignoreBtnText}</button>
-                        <a href="${proxyDownloadUrl}" class="${downloadBtnClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">${downloadBtnText}</a>
+                    <div class="brand-files" style="display: none;">
+                        ${filesHTML.html}
                     </div>
                 </div>
             `;
+            entries.push({ name: brandName, latestDate, fileCount: filesHTML.filteredFileCount, cardHtml });
         });
-        
-        html += '</div>';
-        container.innerHTML = html;
-        
-        // Set up event delegation for download buttons in keyword matches
-        this.setupDownloadEventDelegation(container);
+
+        container.innerHTML = this.sortFavoriteEntries(entries).map(e => e.cardHtml).join('');
+        this.setupBrandEventDelegation(container);
     }
     
     highlightKeywords(text) {
@@ -1990,7 +3064,8 @@ class RSSParser {
             const isDownloaded = this.isFileDownloaded(file.link);
             const isIgnored = this.isFileIgnored(file.link);
             const baseName = this.extractBaseName(file.name);
-            const hasSiblingDownloaded = !isDownloaded && !isIgnored && this.hasSiblingDownloaded(baseName);
+            const hasSiblingIgnored = !isIgnored && this.hasSiblingIgnored(baseName);
+            const hasSiblingDownloaded = !isDownloaded && !isIgnored && !hasSiblingIgnored && this.hasSiblingDownloaded(baseName);
             
             let fileItemClass = `excluded ${ageClass}`;
             let downloadBtnClass = 'download-btn';
@@ -2006,11 +3081,30 @@ class RSSParser {
                 fileItemClass += ' ignored';
                 ignoreBtnClass = 'ignore-btn ignored';
                 ignoreBtnText = '✓ Ignored';
+            } else if (hasSiblingIgnored) {
+                fileItemClass += ' sibling-ignored';
+                ignoreBtnClass = 'ignore-btn sibling-ignored';
+                ignoreBtnText = '↳ Other Quality';
             } else if (hasSiblingDownloaded) {
                 fileItemClass += ' sibling-downloaded';
                 downloadBtnClass = 'download-btn sibling-downloaded';
                 downloadBtnText = '↳ Other Quality';
             }
+            
+            const sabnzbBtnHtml = this.sabnzbConfigured
+                ? (() => {
+                    let sabnzbClass = 'sabnzb-btn';
+                    let sabnzbText = 'Send to SabNZB';
+                    if (isDownloaded) {
+                        sabnzbClass += ' downloaded';
+                        sabnzbText = '✓ Sent to SabNZB';
+                    } else if (hasSiblingDownloaded || hasSiblingIgnored) {
+                        sabnzbClass += ' sibling-downloaded';
+                        sabnzbText = '↳ Other Quality';
+                    }
+                    return `<button type="button" class="${sabnzbClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}"${isDownloaded ? ' disabled' : ''}>${sabnzbText}</button>`;
+                })()
+                : '';
             
             html += `
                 <div class="file-item ${fileItemClass}">
@@ -2024,6 +3118,7 @@ class RSSParser {
                     </div>
                     <div class="file-actions">
                         <button class="${ignoreBtnClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">${ignoreBtnText}</button>
+                        ${sabnzbBtnHtml}
                         <a href="${proxyDownloadUrl}" class="${downloadBtnClass}" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">${downloadBtnText}</a>
                     </div>
                 </div>

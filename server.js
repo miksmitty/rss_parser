@@ -5,12 +5,25 @@ const path = require('path');
 const https = require('https');
 const http = require('http');
 const { URL } = require('url');
+const { spawn } = require('child_process');
+
+require('dotenv').config();
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+
+const SABNZB_BASE_URL = process.env.SABNZB_BASE_URL && process.env.SABNZB_BASE_URL.trim();
+const SABNZB_API_KEY = process.env.SABNZB_API_KEY && process.env.SABNZB_API_KEY.trim();
+const SABNZB_DEFAULT_CATEGORY = (process.env.SABNZB_DEFAULT_CATEGORY || '').trim();
+
+const NZBGEEK_API_URL = (process.env.NZBGEEK_API_URL || 'https://api.nzbgeek.info/api').replace(/\/$/, '');
+const NZBGEEK_API_KEY = process.env.NZBGEEK_API_KEY && process.env.NZBGEEK_API_KEY.trim();
+const NZBGEEK_SEARCH_CAT = (process.env.NZBGEEK_SEARCH_CAT || '6000').trim();
+const NZBGEEK_SEARCH_LIMIT = parseInt(process.env.NZBGEEK_SEARCH_LIMIT || '200', 10) || 200;
 
 // Enable CORS for all routes
 app.use(cors());
+app.use(express.json());
 
 // Serve static files
 app.use(express.static('.'));
@@ -159,7 +172,198 @@ app.get('/proxy/download', (req, res) => {
     makeRequest(url);
 });
 
-app.listen(PORT, () => {
+// SabNZB integration: status (is it configured?)
+app.get('/api/sabnzb/status', (req, res) => {
+    const configured = !!(SABNZB_BASE_URL && SABNZB_API_KEY);
+    res.json({ configured });
+});
+
+// Performer / NZBGeek search (Newznab-compatible API)
+app.get('/api/search', async (req, res) => {
+    if (!NZBGEEK_API_KEY) {
+        return res.status(503).json({ error: 'Search API not configured. Add NZBGEEK_API_KEY (and optionally NZBGEEK_API_URL) to .env' });
+    }
+    const q = req.query.q;
+    if (!q || typeof q !== 'string' || !q.trim()) {
+        return res.status(400).json({ error: 'Query parameter "q" is required' });
+    }
+    const params = new URLSearchParams({
+        t: 'search',
+        q: q.trim(),
+        cat: NZBGEEK_SEARCH_CAT,
+        limit: String(Math.min(500, Math.max(1, NZBGEEK_SEARCH_LIMIT))),
+        extended: '1',
+        o: 'json',
+        apikey: NZBGEEK_API_KEY
+    });
+    const url = `${NZBGEEK_API_URL}?${params.toString()}`;
+    try {
+        const response = await fetch(url, {
+            headers: { 'User-Agent': 'RSSParser/1.0 (https://github.com)' }
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+            const msg = (data && (data.message || data.error || data.description)) || response.statusText;
+            console.error('Search API upstream error:', response.status, msg, 'URL:', `${NZBGEEK_API_URL}?t=search&q=${encodeURIComponent(q.trim())}&cat=${NZBGEEK_SEARCH_CAT}&limit=...&apikey=***`);
+            return res.status(response.status).json({
+                error: response.status === 404
+                    ? 'Indexer returned 404. Check NZBGEEK_API_URL and NZBGEEK_API_KEY in .env (use the API key from your NZBGeek profile).'
+                    : msg
+            });
+        }
+        res.json(data);
+    } catch (err) {
+        console.error('Search API error:', err.message);
+        res.status(500).json({ error: err.message || 'Failed to reach search API' });
+    }
+});
+
+// SabNZB integration: add NZB by URL
+app.post('/api/sabnzb/add', async (req, res) => {
+    if (!SABNZB_BASE_URL || !SABNZB_API_KEY) {
+        return res.status(503).json({ ok: false, error: 'SabNZB not configured (set SABNZB_BASE_URL and SABNZB_API_KEY)' });
+    }
+
+    const { nzbUrl, category, nzbname } = req.body || {};
+    if (!nzbUrl || typeof nzbUrl !== 'string') {
+        return res.status(400).json({ ok: false, error: 'nzbUrl is required' });
+    }
+
+    const base = SABNZB_BASE_URL.replace(/\/$/, '');
+    const params = new URLSearchParams({
+        mode: 'addurl',
+        name: nzbUrl.trim(),
+        apikey: SABNZB_API_KEY
+    });
+    if (category && String(category).trim()) {
+        params.set('cat', String(category).trim());
+    } else if (SABNZB_DEFAULT_CATEGORY) {
+        params.set('cat', SABNZB_DEFAULT_CATEGORY);
+    }
+    if (nzbname && String(nzbname).trim()) {
+        params.set('nzbname', String(nzbname).trim());
+    }
+
+    const sabUrl = `${base}/api?${params.toString()}`;
+
+    try {
+        const response = await fetch(sabUrl);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            return res.status(response.status).json({
+                ok: false,
+                error: data.error || data.message || response.statusText
+            });
+        }
+        if (data.status === false || data.error) {
+            return res.status(400).json({
+                ok: false,
+                error: data.error || data.message || 'SabNZB returned an error'
+            });
+        }
+        res.json({ ok: true, message: data.message || 'Added to queue' });
+    } catch (err) {
+        console.error('SabNZB add error:', err.message);
+        res.status(500).json({ ok: false, error: err.message || 'Failed to reach SabNZB' });
+    }
+});
+
+// SabNZB integration: clear history (delete all history entries in SABnzbd)
+app.post('/api/sabnzb/history/clear', async (req, res) => {
+    if (!SABNZB_BASE_URL || !SABNZB_API_KEY) {
+        return res.status(503).json({ ok: false, error: 'SabNZB not configured (set SABNZB_BASE_URL and SABNZB_API_KEY)' });
+    }
+
+    const base = SABNZB_BASE_URL.replace(/\/$/, '');
+
+    function sabFetch(params) {
+        const q = new URLSearchParams({ ...params, output: 'json', apikey: SABNZB_API_KEY });
+        return fetch(`${base}/api?${q.toString()}`, { method: 'GET' });
+    }
+
+    try {
+        // First try: delete all in one call (supported by most SABnzbd versions)
+        const deleteAllParams = { mode: 'history', name: 'delete', value: 'all' };
+        const deleteAllRes = await sabFetch(deleteAllParams);
+        const deleteAllData = await deleteAllRes.json().catch(() => ({}));
+
+        if (deleteAllRes.ok && deleteAllData.status !== false && !deleteAllData.error) {
+            return res.json({ ok: true, message: 'History cleared' });
+        }
+
+        if (deleteAllRes.status === 404) {
+            // Fallback: fetch history slots then delete by nzo_id (works when value=all is not supported)
+            const historyRes = await sabFetch({ mode: 'history', limit: '500' });
+            const historyData = await historyRes.json().catch(() => ({}));
+
+            if (!historyRes.ok || !historyData.history || !Array.isArray(historyData.history.slots)) {
+                const msg = historyData.error || historyData.message || historyRes.statusText;
+                console.error('SabNZB clear history: delete all 404, history fetch failed:', historyRes.status, msg);
+                return res.status(404).json({
+                    ok: false,
+                    error: 'Not Found. Use the full API key from SABnzbd Config → General (not the NZB-only key). If SABnzbd uses a subpath (e.g. /sabnzbd), set SABNZB_BASE_URL to include it.'
+                });
+            }
+
+            const slots = historyData.history.slots;
+            if (slots.length === 0) {
+                return res.json({ ok: true, message: 'History cleared (already empty)' });
+            }
+
+            const nzoIds = slots.map(s => s.nzo_id).filter(Boolean);
+            // Delete in one call with comma-separated ids (per wiki: value=NZO_ID_1,NZO_ID_2,NZO_ID_3)
+            const value = nzoIds.join(',');
+            const deleteRes = await sabFetch({ mode: 'history', name: 'delete', value, archive: '0' });
+            const deleteData = await deleteRes.json().catch(() => ({}));
+
+            if (!deleteRes.ok || deleteData.status === false || deleteData.error) {
+                const msg = deleteData.error || deleteData.message || deleteRes.statusText;
+                console.error('SabNZB clear history: delete by ids failed:', deleteRes.status, msg);
+                return res.status(deleteRes.ok ? 400 : deleteRes.status).json({
+                    ok: false,
+                    error: msg
+                });
+            }
+            return res.json({ ok: true, message: 'History cleared' });
+        }
+
+        // Non-404 error from delete all
+        const message = deleteAllData.error || deleteAllData.message || deleteAllRes.statusText;
+        console.error('SabNZB clear history failed:', deleteAllRes.status, message);
+        return res.status(deleteAllRes.status).json({
+            ok: false,
+            error: message
+        });
+    } catch (err) {
+        console.error('SabNZB clear history error:', err.message);
+        res.status(500).json({ ok: false, error: err.message || 'Failed to reach SabNZB' });
+    }
+});
+
+// Restart server (closes this process and spawns a new one after a short delay)
+function handleRestart(req, res) {
+    res.json({ ok: true, message: 'Restarting...' });
+    const cwd = process.cwd();
+    const delayScript = `setTimeout(() => {
+        const { spawn } = require('child_process');
+        const path = require('path');
+        const c = spawn(process.execPath, [path.join(${JSON.stringify(cwd)}, 'server.js')], { detached: true, stdio: 'ignore', cwd: ${JSON.stringify(cwd)} });
+        c.unref();
+    }, 2500);`;
+    const child = spawn(process.execPath, ['-e', delayScript], { detached: true, stdio: 'ignore', cwd });
+    child.unref();
+    server.close(() => process.exit(0));
+}
+app.post('/api/restart', handleRestart);
+app.get('/api/restart', handleRestart);
+
+const server = app.listen(PORT, () => {
     console.log(`RSS Parser server running at http://localhost:${PORT}`);
     console.log(`Proxy endpoint: http://localhost:${PORT}/proxy/rss?url=YOUR_RSS_URL`);
+    if (SABNZB_BASE_URL && SABNZB_API_KEY) {
+        console.log('SabNZB integration enabled');
+    }
+    if (NZBGEEK_API_KEY) {
+        console.log('Performer search (NZBGeek) enabled');
+    }
 });
