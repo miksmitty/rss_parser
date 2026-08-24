@@ -17,16 +17,29 @@ class RSSParser {
 
         // Load saved data safely
         this.favoriteBrands = this.loadArray('rssParserFavoriteBrands');
-        this.antiFavoriteBrands = this.loadArray('rssParserAntiFavoriteBrands'); 
+        this.antiFavoriteBrands = this.loadArray('rssParserAntiFavoriteBrands');
         this.keywords = this.loadArray('rssParserKeywords');
+        this.performers = this.loadArray('rssParserPerformers');
         this.excludeKeywords = this.loadArray('rssParserExcludeKeywords');
         this.downloadedFiles = this.loadDownloadedFiles();
         this.ignoredFiles = this.loadIgnoredFiles();
         this.urlHistory = this.loadArray('rssParserUrlHistory');
         this.sabnzbConfigured = false;
-        // Favorites tab sort mode (persisted); "custom" keeps the user's own
-        // favourites order / alphabetical keyword-match order
+        // Favorites/Performers tab sort mode (persisted); "custom" keeps the
+        // user's own favourites order / alphabetical match order
         this.favoritesSortMode = localStorage.getItem('rssParserFavoritesSort') || 'custom';
+        this.performersSortMode = localStorage.getItem('rssParserPerformersSort') || 'custom';
+        // Session-only cache of performer name -> candidate thumbnail URLs,
+        // so re-rendering the tag list doesn't re-fetch every performer
+        this.performerThumbnailCache = new Map();
+        // Persisted: performer name (lowercased) -> the thumbnail URL the user
+        // picked. Takes priority over the auto-fetched default once set.
+        this.performerThumbnails = this.loadObject('rssParserPerformerThumbnails') || {};
+
+        // One-time split of the old mixed keywords list into Keywords vs
+        // Performers, based on name shape ("Firstname Lastname"-style entries
+        // move to Performers; everything else stays a keyword)
+        this.migratePerformersFromKeywords();
         
         // Load default RSS URL (most recent from history or saved default)
         const savedUrl = localStorage.getItem('rssParserDefaultUrl');
@@ -50,6 +63,7 @@ class RSSParser {
         this.initializeSizeFilter();
         this.initializeTagListTools();
         this.initializeFavoritesTools();
+        this.initializePerformersTools();
 
         // Display saved favorites and keywords
         setTimeout(() => {
@@ -81,6 +95,58 @@ class RSSParser {
         } catch (error) {
             console.error(`Error saving ${key}:`, error);
         }
+    }
+
+    // "Firstname Lastname[ Lastname]" shape - 2-3 capitalised words, letters
+    // only. Used both for the one-time keyword/performer migration and to
+    // guess a default category while searching. Never authoritative - always
+    // overridable by the user.
+    looksLikePerformerName(text) {
+        return /^[A-Z][a-zA-Z'-]*(?:\s+[A-Z][a-zA-Z'-]*){1,2}$/.test((text || '').trim());
+    }
+
+    // Default pick for the search box's Performer/Keyword/Do not add
+    // selector. A term matching an existing favourite brand should never be
+    // filed as a performer or keyword - that's what bit "nancylove" (a
+    // brand) getting auto-added as a performer when searched from its
+    // Quick Search chip.
+    guessSearchSaveType(text) {
+        const trimmed = (text || '').trim();
+        if (!trimmed) return 'performer';
+        const isFavoriteBrand = this.favoriteBrands.some(b => b.toLowerCase() === trimmed.toLowerCase());
+        if (isFavoriteBrand) return 'none';
+        return this.looksLikePerformerName(trimmed) ? 'performer' : 'keyword';
+    }
+
+    /**
+     * Runs once. Keywords used to double as performer names, so any existing
+     * entry that looks like a person's name ("Firstname Lastname[ Lastname]",
+     * 2-3 capitalised words, letters only) is moved into the new Performers
+     * list. Single-word or non-name-shaped entries stay as general keywords.
+     * The heuristic won't always be right — misclassified tags can be moved
+     * with the ↔ button on their tag in either list.
+     */
+    migratePerformersFromKeywords() {
+        if (localStorage.getItem('rssParserPerformersMigrated') === '1') return;
+
+        const remainingKeywords = [];
+
+        this.keywords.forEach(keyword => {
+            const trimmed = keyword.trim();
+            const isPerformerLike = this.looksLikePerformerName(trimmed) &&
+                !this.performers.some(p => p.toLowerCase() === trimmed.toLowerCase());
+            if (isPerformerLike) {
+                this.performers.push(keyword);
+            } else {
+                remainingKeywords.push(keyword);
+            }
+        });
+
+        this.keywords = remainingKeywords;
+        this.saveArray('rssParserKeywords', this.keywords);
+        this.saveArray('rssParserPerformers', this.performers);
+        localStorage.setItem('rssParserPerformersMigrated', '1');
+        console.log(`Migrated ${this.performers.length} performer-looking keyword(s) into the new Performers list`);
     }
 
     loadObject(key) {
@@ -187,6 +253,7 @@ class RSSParser {
         this.downloadedFiles[fileId] = {
             fileName: fileName,
             baseName: baseName,
+            link: fileLink, // kept so a later "redownload recent files" can reissue the NZB
             downloadedAt: new Date().toISOString()
         };
         this.saveDownloadedFiles();
@@ -312,6 +379,12 @@ class RSSParser {
         if (clearSabnzbHistoryBtn) {
             clearSabnzbHistoryBtn.addEventListener('click', () => this.clearSabNZBHistory());
         }
+
+        // Redownload recent files (e.g. after an accidental local deletion)
+        const redownloadBtn = document.getElementById('redownload-btn');
+        if (redownloadBtn) {
+            redownloadBtn.addEventListener('click', () => this.openRedownloadPicker(redownloadBtn));
+        }
         
         // Scroll to top button
         const scrollToTopBtn = document.getElementById('scroll-to-top-btn');
@@ -334,6 +407,27 @@ class RSSParser {
             performerSearchBtn.addEventListener('click', () => this.fetchPerformerSearch());
             performerSearchInput.addEventListener('keypress', (e) => {
                 if (e.key === 'Enter') this.fetchPerformerSearch();
+            });
+        }
+
+        // Guess Performer / Keyword / Do not add from the term's shape as the
+        // user types (this search box isn't performer-only), but stop
+        // guessing the moment they pick a category themselves - that choice
+        // sticks until the box is cleared and a new term is started
+        const searchTypeSelect = document.getElementById('save-search-term-type');
+        if (performerSearchInput && searchTypeSelect) {
+            let searchTypeManuallySet = false;
+            searchTypeSelect.addEventListener('change', () => {
+                searchTypeManuallySet = true;
+            });
+            performerSearchInput.addEventListener('input', () => {
+                const value = performerSearchInput.value;
+                if (!value.trim()) {
+                    searchTypeManuallySet = false;
+                }
+                if (!searchTypeManuallySet) {
+                    searchTypeSelect.value = this.guessSearchSaveType(value);
+                }
             });
         }
         
@@ -371,6 +465,8 @@ class RSSParser {
                     // Load content for specific tabs
                     if (tabName === 'favorites') {
                         this.displayFavorites();
+                    } else if (tabName === 'performers') {
+                        this.displayPerformers();
                     } else if (tabName === 'excluded') {
                         this.displayExcludedFiles();
                     }
@@ -547,7 +643,19 @@ class RSSParser {
                 }
             });
         }
-        
+
+        // Add performer button
+        const addPerformerBtn = document.getElementById('add-performer-btn');
+        if (addPerformerBtn) {
+            addPerformerBtn.addEventListener('click', () => {
+                const input = document.getElementById('add-performer-input');
+                if (input && input.value.trim()) {
+                    this.addPerformer(input.value.trim());
+                    input.value = '';
+                }
+            });
+        }
+
         // Enter key support
         const brandInput = document.getElementById('add-brand-input');
         if (brandInput) {
@@ -572,6 +680,15 @@ class RSSParser {
             excludeInput.addEventListener('keypress', (e) => {
                 if (e.key === 'Enter') {
                     addExcludeBtn.click();
+                }
+            });
+        }
+
+        const performerInput = document.getElementById('add-performer-input');
+        if (performerInput) {
+            performerInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    addPerformerBtn.click();
                 }
             });
         }
@@ -858,7 +975,7 @@ class RSSParser {
             : (input && input.value ? input.value.trim() : '');
         const q = raw.replace(/\./g, ' ');
         if (!q) {
-            alert('Enter a performer name to search.');
+            alert('Enter a performer name or keyword to search.');
             return;
         }
         // Reflect the chosen term in the search box for visibility
@@ -881,7 +998,26 @@ class RSSParser {
             } else {
                 const saveTermEl = document.getElementById('save-search-term');
                 if (raw && (!saveTermEl || saveTermEl.checked)) {
-                    this.addKeyword(raw);
+                    // Don't reclassify a term already tracked under another
+                    // list (e.g. re-running a search from an existing Keyword
+                    // chip) - and a favourite BRAND is never eligible either,
+                    // regardless of the dropdown's state. This is enforced
+                    // here rather than only via the dropdown guess because
+                    // Quick Search chip clicks (e.g. a Favourites chip) never
+                    // touch the search box's typing/guess path at all.
+                    const alreadyTracked =
+                        this.favoriteBrands.some(b => b.toLowerCase() === raw.toLowerCase()) ||
+                        this.keywords.some(k => k.toLowerCase() === raw.toLowerCase()) ||
+                        this.performers.some(p => p.toLowerCase() === raw.toLowerCase());
+                    if (!alreadyTracked) {
+                        // Not every search is for a performer - respect the
+                        // Performer/Keyword/Do-not-add choice next to the
+                        // save checkbox instead of always filing it as a performer
+                        const typeSelect = document.getElementById('save-search-term-type');
+                        const saveAs = typeSelect ? typeSelect.value : 'performer';
+                        if (saveAs === 'keyword') this.addKeyword(raw);
+                        else if (saveAs === 'performer') this.addPerformer(raw);
+                    }
                 }
                 this.displayResults();
                 const resultsTab = document.querySelector('.tab-btn[data-tab="results"]');
@@ -1164,6 +1300,167 @@ class RSSParser {
             });
             overlay.querySelector('.bdc-cancel-btn').addEventListener('click', () => close(null));
             confirmBtn.addEventListener('click', () => close(selections.slice(0, currentLimit())));
+            if (limitInput) limitInput.addEventListener('input', refresh);
+            document.addEventListener('keydown', onKeydown);
+
+            refresh();
+            document.body.appendChild(overlay);
+            confirmBtn.focus();
+        });
+    }
+
+    /**
+     * Previously-downloaded files eligible for a redownload, newest first.
+     * Only entries with a stored `link` can actually be reissued — older
+     * history recorded before markFileAsDownloaded kept the link is counted
+     * separately so that gap isn't silently hidden from the user.
+     */
+    getRedownloadableHistory() {
+        const all = Object.values(this.downloadedFiles).filter(f => f && f.downloadedAt);
+        all.sort((a, b) => new Date(b.downloadedAt) - new Date(a.downloadedAt));
+
+        const entries = all
+            .filter(f => f.link)
+            .map(f => ({ name: f.fileName, link: f.link, downloadedAt: new Date(f.downloadedAt) }));
+        const missingLinkCount = all.length - entries.length;
+
+        return { entries, missingLinkCount };
+    }
+
+    // Entry point for the "Redownload recent" action — e.g. recovering from
+    // an accidental local deletion. Lets the user pick how many of their most
+    // recently downloaded files to reissue, then resends them the same way
+    // (SabNZB or browser download) as a normal download.
+    async openRedownloadPicker(buttonElement) {
+        const { entries, missingLinkCount } = this.getRedownloadableHistory();
+
+        if (entries.length === 0) {
+            alert(missingLinkCount > 0
+                ? `${missingLinkCount} earlier download${missingLinkCount !== 1 ? 's are' : ' is'} recorded, but from before this feature could reissue them — nothing available to redownload automatically.`
+                : "No download history yet — nothing to redownload.");
+            return;
+        }
+
+        const via = this.sabnzbConfigured ? 'SabNZB' : 'browser download';
+        const chosen = await this.showRedownloadConfirm(entries, missingLinkCount, via);
+        if (!chosen || chosen.length === 0) return;
+
+        if (buttonElement) buttonElement.disabled = true;
+        const originalText = buttonElement ? buttonElement.textContent : '';
+        let sent = 0;
+        const failures = [];
+
+        for (const file of chosen) {
+            if (buttonElement) buttonElement.textContent = `${sent + 1}/${chosen.length}…`;
+            try {
+                if (this.sabnzbConfigured) {
+                    await this.sendToSabNZB(file.link, file.name);
+                } else {
+                    this.triggerBrowserDownload(file);
+                    // Brief pause so the browser doesn't drop rapid-fire downloads
+                    await new Promise(resolve => setTimeout(resolve, 400));
+                }
+                this.markFileAsDownloaded(file.link, file.name);
+                this.markFileDownloadedInDOM(file.link, file.name);
+                sent++;
+            } catch (err) {
+                failures.push(`${file.name}: ${err.message}`);
+            }
+        }
+
+        this.updateBrandDownloadStatus();
+        if (buttonElement) {
+            buttonElement.disabled = false;
+            buttonElement.textContent = sent > 0 ? `✓ ${sent} sent` : originalText;
+        }
+        if (failures.length > 0) {
+            alert(`${failures.length} of ${chosen.length} failed:\n\n${failures.join('\n')}`);
+        }
+    }
+
+    /**
+     * Confirmation dialog for redownloading recent history — mirrors
+     * showBrandDownloadConfirm's shell, but the list is sourced from download
+     * history rather than a brand, and the limit reads "last N" instead of
+     * "newest N". Resolves with the chosen files, or null on cancel.
+     */
+    showRedownloadConfirm(entries, missingLinkCount, via) {
+        return new Promise(resolve => {
+            const rows = entries.map((file, i) => `
+                <li class="bdc-file" data-index="${i}">
+                    <span class="bdc-file-name">${this.escapeHtml(file.name)}</span>
+                    <span class="bdc-file-size">${this.escapeHtml(this.getTimeAgo(file.downloadedAt))}</span>
+                </li>
+            `).join('');
+
+            const defaultLimit = Math.min(10, entries.length);
+            const limitControl = entries.length > 1 ? `
+                <div class="bdc-limit">
+                    <label for="rdl-limit-input">Redownload last</label>
+                    <input type="number" id="rdl-limit-input" min="1" max="${entries.length}" step="1" value="${defaultLimit}">
+                    <span class="bdc-limit-of">of ${entries.length} available</span>
+                </div>
+            ` : '';
+
+            const overlay = document.createElement('div');
+            overlay.className = 'bdc-overlay';
+            overlay.innerHTML = `
+                <div class="bdc-dialog" role="dialog" aria-modal="true" aria-labelledby="rdl-title">
+                    <h3 id="rdl-title">Redownload recent files</h3>
+                    <div class="bdc-summary">
+                        <div class="bdc-stat">
+                            <span class="bdc-stat-value" id="rdl-count"></span>
+                            <span class="bdc-stat-label">files</span>
+                        </div>
+                        <div class="bdc-stat">
+                            <span class="bdc-stat-value">${this.escapeHtml(via)}</span>
+                            <span class="bdc-stat-label">via</span>
+                        </div>
+                    </div>
+                    ${missingLinkCount > 0 ? `<p class="rdl-missing-note">${missingLinkCount} older download${missingLinkCount !== 1 ? 's' : ''} can't be included — recorded before this feature tracked the original link.</p>` : ''}
+                    ${limitControl}
+                    <ul class="bdc-file-list">${rows}</ul>
+                    <div class="bdc-actions">
+                        <button type="button" class="bdc-cancel-btn">Cancel</button>
+                        <button type="button" class="bdc-confirm-btn"></button>
+                    </div>
+                </div>
+            `;
+
+            const limitInput = overlay.querySelector('#rdl-limit-input');
+            const confirmBtn = overlay.querySelector('.bdc-confirm-btn');
+
+            const currentLimit = () => {
+                if (!limitInput) return entries.length;
+                const n = parseInt(limitInput.value, 10);
+                if (isNaN(n) || n < 1) return entries.length;
+                return Math.min(n, entries.length);
+            };
+
+            const refresh = () => {
+                const limit = currentLimit();
+                overlay.querySelector('#rdl-count').textContent = limit;
+                confirmBtn.textContent = `⬇ Redownload ${limit} ${limit !== 1 ? 'files' : 'file'}`;
+                overlay.querySelectorAll('.bdc-file').forEach(row => {
+                    const i = parseInt(row.getAttribute('data-index'), 10);
+                    row.classList.toggle('bdc-excluded', i >= limit);
+                });
+            };
+
+            const close = (result) => {
+                document.removeEventListener('keydown', onKeydown);
+                overlay.remove();
+                resolve(result);
+            };
+            const onKeydown = (e) => {
+                if (e.key === 'Escape') close(null);
+            };
+
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) close(null);
+            });
+            overlay.querySelector('.bdc-cancel-btn').addEventListener('click', () => close(null));
+            confirmBtn.addEventListener('click', () => close(entries.slice(0, currentLimit())));
             if (limitInput) limitInput.addEventListener('input', refresh);
             document.addEventListener('keydown', onKeydown);
 
@@ -1618,7 +1915,7 @@ class RSSParser {
             html += `
                 <div class="${brandClasses}" data-brand="${this.escapeHtml(brandName)}">
                     <div class="brand-header">
-                        <h3>${this.escapeHtml(brandName)} (${filesHTML.filteredFileCount} files)${isFullyDownloaded ? ' <span class="fully-downloaded-badge">✓ All Reviewed</span>' : ''}</h3>
+                        <h3>${this.escapeHtml(brandName)} (${this.fileCountLabel(filesHTML)})${isFullyDownloaded ? ' <span class="fully-downloaded-badge">✓ All Reviewed</span>' : ''}</h3>
                         <div class="brand-controls">
                             <span class="brand-latest">${brandLatestDate ? this.getTimeAgo(brandLatestDate) : ''}</span>
                             <button class="favorite-btn ${isFavorite ? 'active' : ''}" data-action="favorite" data-brand="${this.escapeHtml(brandName)}">
@@ -2008,6 +2305,7 @@ class RSSParser {
     generateBrandFilesHTML(brandFiles, cutoffTime = null) {
         let html = '';
         let filteredFileCount = 0;
+        let availableFileCount = 0;
         
         // Sort by base name
         const sortedFiles = Array.from(brandFiles.entries()).sort((a, b) => a[0].localeCompare(b[0]));
@@ -2043,7 +2341,10 @@ class RSSParser {
                 const isIgnored = this.isFileIgnored(file.link);
                 const hasSiblingIgnored = !isIgnored && this.hasSiblingIgnored(baseName);
                 const hasSiblingDownloaded = !isDownloaded && !isIgnored && !hasSiblingIgnored && this.hasSiblingDownloaded(baseName);
-                
+                if (!isDownloaded && !isIgnored && !hasSiblingIgnored && !hasSiblingDownloaded) {
+                    availableFileCount++;
+                }
+
                 let fileItemClass = ageClass;
                 if (fileIndex === preferredIndex) {
                     fileItemClass += ' preferred-size';
@@ -2107,7 +2408,15 @@ class RSSParser {
             html += `</div>`;
         });
         
-        return { html, filteredFileCount };
+        return { html, filteredFileCount, availableFileCount };
+    }
+
+    // Brand-header file count text, e.g. "12 files, 3 available" - showing
+    // only the total was misleading once most of a brand's files had already
+    // been downloaded or ignored.
+    fileCountLabel(filesHTML) {
+        const total = filesHTML.filteredFileCount;
+        return `${total} file${total !== 1 ? 's' : ''}, ${filesHTML.availableFileCount} available`;
     }
     
     getAgeClass(date) {
@@ -2344,9 +2653,258 @@ class RSSParser {
             this.displayFavoritesAndKeywords();
         }
     }
-    
+
+    addPerformer(name) {
+        // Case-insensitive dedupe, same as addKeyword
+        const exists = this.performers.some(p => p.toLowerCase() === name.toLowerCase());
+        if (!exists) {
+            this.performers.push(name);
+            this.saveArray('rssParserPerformers', this.performers);
+            this.displayFavoritesAndKeywords();
+            this.applyKeywordHighlighting();
+            // New performer: offer a choice of thumbnails rather than silently
+            // picking whichever gallery still turns up first
+            this.selectPerformerThumbnail(name);
+        }
+    }
+
+    removePerformer(name) {
+        const index = this.performers.indexOf(name);
+        if (index !== -1) {
+            this.performers.splice(index, 1);
+            this.saveArray('rssParserPerformers', this.performers);
+            this.displayFavoritesAndKeywords();
+            this.applyKeywordHighlighting();
+        }
+    }
+
+    // Fetch up to 10 candidate thumbnail URLs for a performer, caching the
+    // result client-side for the session (server also caches across requests)
+    async fetchPerformerThumbnailCandidates(name) {
+        const key = name.toLowerCase();
+        if (this.performerThumbnailCache.has(key)) {
+            return this.performerThumbnailCache.get(key);
+        }
+        try {
+            const res = await fetch(`/api/performer-thumbnails?name=${encodeURIComponent(name)}`);
+            const data = await res.json().catch(() => ({}));
+            const urls = Array.isArray(data && data.imageUrls) ? data.imageUrls : [];
+            this.performerThumbnailCache.set(key, urls);
+            return urls;
+        } catch (err) {
+            return [];
+        }
+    }
+
+    /**
+     * Resolve a performer's thumbnail and set it on the given <img>. A
+     * persisted user pick (from selectPerformerThumbnail) always wins;
+     * otherwise the first auto-fetched candidate is used as a default.
+     * Hotlinked directly from thumbnailseries.com (a third-party gallery
+     * aggregator, not a source of curated headshots) - leaves the placeholder
+     * icon in place if nothing is found or the request fails.
+     */
+    async loadPerformerThumbnail(name, imgEl) {
+        const key = name.toLowerCase();
+
+        const chosen = this.performerThumbnails[key];
+        if (chosen) {
+            this.applyPerformerThumbnail(imgEl, chosen);
+            return;
+        }
+
+        const urls = await this.fetchPerformerThumbnailCandidates(name);
+        // The tag list may have re-rendered while this was in flight
+        if (urls.length > 0 && imgEl.isConnected) this.applyPerformerThumbnail(imgEl, urls[0]);
+    }
+
+    applyPerformerThumbnail(imgEl, url) {
+        imgEl.addEventListener('load', () => imgEl.classList.add('loaded'), { once: true });
+        imgEl.src = url;
+    }
+
+    /**
+     * Fetch up to 10 thumbnail candidates for a performer and let the user
+     * pick one, upload their own photo, or paste an image URL. The choice is
+     * persisted (rssParserPerformerThumbnails) and takes priority over the
+     * auto-fetched default from then on. Always opens (even with zero
+     * auto-fetched candidates) since uploading/pasting is always available.
+     */
+    async selectPerformerThumbnail(name) {
+        const urls = await this.fetchPerformerThumbnailCandidates(name);
+        const chosenUrl = await this.showThumbnailPicker(name, urls);
+        if (!chosenUrl) return;
+
+        this.performerThumbnails[name.toLowerCase()] = chosenUrl;
+        this.saveObject('rssParserPerformerThumbnails', this.performerThumbnails);
+        this.displayFavoritesAndKeywords();
+    }
+
+    // Resize/compress an uploaded image client-side before it goes into
+    // localStorage as a data: URL, so one photo doesn't eat the storage quota
+    compressImageFile(file, maxDimension = 320, quality = 0.85) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onerror = () => reject(new Error('Could not read that file'));
+            reader.onload = () => {
+                const img = new Image();
+                img.onerror = () => reject(new Error('That file is not a readable image'));
+                img.onload = () => {
+                    const scale = Math.min(1, maxDimension / Math.max(img.width, img.height));
+                    const canvas = document.createElement('canvas');
+                    canvas.width = Math.round(img.width * scale);
+                    canvas.height = Math.round(img.height * scale);
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    resolve(canvas.toDataURL('image/jpeg', quality));
+                };
+                img.src = reader.result;
+            };
+            reader.readAsDataURL(file);
+        });
+    }
+
+    // Preload a pasted image URL so a typo/dead link surfaces immediately
+    // instead of silently leaving the placeholder icon showing later
+    preloadImage(url) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => resolve(url);
+            img.onerror = () => reject(new Error('Could not load an image from that URL'));
+            img.src = url;
+        });
+    }
+
+    // Modal offering up to 10 auto-fetched thumbnail options for a performer,
+    // plus an upload-your-own and paste-a-URL fallback. Resolves with the
+    // chosen URL (hotlink or a compressed data: URL), or null if closed
+    // without picking.
+    showThumbnailPicker(name, urls) {
+        return new Promise(resolve => {
+            const optionsHtml = urls.length > 0
+                ? urls.map((url, i) => `
+                    <button type="button" class="ptp-option" data-url="${this.escapeHtml(url)}" title="Use this photo">
+                        <img src="${this.escapeHtml(url)}" alt="Option ${i + 1}">
+                    </button>
+                `).join('')
+                : '<p class="ptp-empty">No photos found automatically for this performer.</p>';
+
+            const overlay = document.createElement('div');
+            overlay.className = 'bdc-overlay';
+            overlay.innerHTML = `
+                <div class="bdc-dialog ptp-dialog" role="dialog" aria-modal="true" aria-labelledby="ptp-title">
+                    <h3 id="ptp-title">Choose a photo for ${this.escapeHtml(name)}</h3>
+                    <div class="ptp-options">${optionsHtml}</div>
+                    <div class="ptp-custom">
+                        <label class="ptp-upload-btn">
+                            Upload your own
+                            <input type="file" accept="image/*" class="ptp-file-input" hidden>
+                        </label>
+                        <div class="ptp-url-row">
+                            <input type="url" class="ptp-url-input" placeholder="Or paste an image URL">
+                            <button type="button" class="ptp-url-btn">Use</button>
+                        </div>
+                        <p class="ptp-hint">Tip: copy an image elsewhere and paste it (⌘V / Ctrl+V) anywhere in this window</p>
+                        <p class="ptp-error" hidden></p>
+                    </div>
+                    <div class="bdc-actions">
+                        <button type="button" class="bdc-cancel-btn">Skip</button>
+                    </div>
+                </div>
+            `;
+
+            const errorEl = overlay.querySelector('.ptp-error');
+            const showError = (msg) => {
+                errorEl.textContent = msg;
+                errorEl.hidden = false;
+            };
+
+            const close = (result) => {
+                document.removeEventListener('keydown', onKeydown);
+                document.removeEventListener('paste', onPaste);
+                overlay.remove();
+                resolve(result);
+            };
+            const onKeydown = (e) => {
+                if (e.key === 'Escape') close(null);
+            };
+
+            // Clipboard image paste (Cmd/Ctrl+V) - works anywhere while the
+            // dialog is open, no need to focus a specific field first
+            const onPaste = async (e) => {
+                const items = e.clipboardData && e.clipboardData.items;
+                if (!items) return;
+                for (const item of items) {
+                    if (item.kind === 'file' && item.type.startsWith('image/')) {
+                        e.preventDefault();
+                        const file = item.getAsFile();
+                        if (!file) return;
+                        try {
+                            const dataUrl = await this.compressImageFile(file);
+                            close(dataUrl);
+                        } catch (err) {
+                            showError(err.message);
+                        }
+                        return;
+                    }
+                }
+            };
+
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) close(null);
+            });
+            overlay.querySelector('.bdc-cancel-btn').addEventListener('click', () => close(null));
+            overlay.querySelectorAll('.ptp-option').forEach(btn => {
+                btn.addEventListener('click', () => close(btn.getAttribute('data-url')));
+            });
+
+            const fileInput = overlay.querySelector('.ptp-file-input');
+            fileInput.addEventListener('change', async () => {
+                const file = fileInput.files && fileInput.files[0];
+                if (!file) return;
+                try {
+                    const dataUrl = await this.compressImageFile(file);
+                    close(dataUrl);
+                } catch (err) {
+                    showError(err.message);
+                }
+            });
+
+            const urlInput = overlay.querySelector('.ptp-url-input');
+            const urlBtn = overlay.querySelector('.ptp-url-btn');
+            const useUrl = async () => {
+                const value = urlInput.value.trim();
+                if (!value) return;
+                urlBtn.disabled = true;
+                urlBtn.textContent = 'Checking…';
+                try {
+                    await this.preloadImage(value);
+                    close(value);
+                } catch (err) {
+                    showError(err.message);
+                    urlBtn.disabled = false;
+                    urlBtn.textContent = 'Use';
+                }
+            };
+            urlBtn.addEventListener('click', useUrl);
+            urlInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') useUrl();
+            });
+
+            document.addEventListener('keydown', onKeydown);
+            document.addEventListener('paste', onPaste);
+
+            document.body.appendChild(overlay);
+        });
+    }
+
     applyKeywordHighlighting() {
-        if (!Array.isArray(this.keywords) || this.keywords.length === 0) return;
+        // Performer names highlight the same way general keywords do
+        const terms = [
+            ...(Array.isArray(this.keywords) ? this.keywords : []),
+            ...(Array.isArray(this.performers) ? this.performers : [])
+        ];
+        if (terms.length === 0) return;
 
         document.querySelectorAll('.file-name').forEach(element => {
             const fileItem = element.closest('.file-item');
@@ -2360,8 +2918,8 @@ class RSSParser {
             const text = element.textContent;
             let highlightedText = text;
 
-            this.keywords.forEach(keyword => {
-                const regex = new RegExp(`(${keyword})`, 'gi');
+            terms.forEach(term => {
+                const regex = new RegExp(`(${term})`, 'gi');
                 highlightedText = highlightedText.replace(regex, '<mark>$1</mark>');
             });
 
@@ -2424,20 +2982,22 @@ class RSSParser {
         this.displayFavoriteBrands();
         this.displayKeywords();
         this.displayExcludeKeywords();
+        this.displayPerformersList();
         this.displayQuickSearchChips();
     }
 
     // Populate the collapsible "Quick search" panel with a chip per favourite
-    // brand and highlight keyword. The panel is hidden entirely when there is
-    // nothing to show, and stays collapsed until the user opens it.
+    // brand, performer, and highlight keyword. The panel is hidden entirely
+    // when there is nothing to show, and stays collapsed until the user opens it.
     displayQuickSearchChips() {
         const wrapper = document.getElementById('quick-search');
         const container = document.getElementById('quick-search-chips');
         if (!wrapper || !container) return;
 
         const favs = Array.isArray(this.favoriteBrands) ? this.favoriteBrands : [];
+        const perfs = Array.isArray(this.performers) ? this.performers : [];
         const kws = Array.isArray(this.keywords) ? this.keywords : [];
-        const total = favs.length + kws.length;
+        const total = favs.length + perfs.length + kws.length;
 
         if (total === 0) {
             wrapper.hidden = true;
@@ -2456,6 +3016,10 @@ class RSSParser {
         if (favs.length) {
             html += `<div class="chip-row"><span class="chip-row-label">Favourites:</span>` +
                 favs.map(b => chip(b, 'fav-chip')).join('') + `</div>`;
+        }
+        if (perfs.length) {
+            html += `<div class="chip-row"><span class="chip-row-label">Performers:</span>` +
+                perfs.map(p => chip(p, 'perf-chip')).join('') + `</div>`;
         }
         if (kws.length) {
             html += `<div class="chip-row"><span class="chip-row-label">Keywords:</span>` +
@@ -2505,29 +3069,36 @@ class RSSParser {
         this.renderTagList('exclude-keywords-list', 'exclude', 'No exclude keywords added.');
     }
 
-    // ---- Shared tag-list rendering & management (favourites / keywords / excludes) ----
+    displayPerformersList() {
+        this.renderTagList('performers-list', 'performer', 'No performers added yet.');
+    }
+
+    // ---- Shared tag-list rendering & management (favourites / keywords / performers / excludes) ----
 
     _tagArrayFor(type) {
         if (type === 'favorite') return this.favoriteBrands;
         if (type === 'exclude') return this.excludeKeywords;
+        if (type === 'performer') return this.performers;
         return this.keywords;
     }
 
     _tagStorageKeyFor(type) {
         if (type === 'favorite') return 'rssParserFavoriteBrands';
         if (type === 'exclude') return 'rssParserExcludeKeywords';
+        if (type === 'performer') return 'rssParserPerformers';
         return 'rssParserKeywords';
     }
 
     _tagContainerIdFor(type) {
         if (type === 'favorite') return 'favorite-brands-list';
         if (type === 'exclude') return 'exclude-keywords-list';
+        if (type === 'performer') return 'performers-list';
         return 'keywords-list';
     }
 
     // Wire the per-list search boxes and A→Z sort buttons in the management tab
     initializeTagListTools() {
-        this.tagFilters = { favorite: '', keyword: '', exclude: '' };
+        this.tagFilters = { favorite: '', keyword: '', exclude: '', performer: '' };
         this.tagSortDirection = {}; // per-type toggle between asc and desc
 
         document.querySelectorAll('.tag-filter-input').forEach(input => {
@@ -2589,7 +3160,7 @@ class RSSParser {
 
         this.saveArray(this._tagStorageKeyFor(type), arr);
         this.displayFavoritesAndKeywords();
-        if (type === 'keyword') this.applyKeywordHighlighting();
+        if (type === 'keyword' || type === 'performer') this.applyKeywordHighlighting();
         if (type === 'favorite' && this.brands.size > 0) this.displayResults();
     }
 
@@ -2603,20 +3174,57 @@ class RSSParser {
             return;
         }
 
-        const extraClass = type === 'favorite' ? 'favorite-tag' : (type === 'exclude' ? 'exclude-tag' : '');
+        const extraClass = type === 'favorite' ? 'favorite-tag' : (type === 'exclude' ? 'exclude-tag' : (type === 'performer' ? 'performer-tag' : ''));
         const searchable = type !== 'exclude';
+        // Keywords and Performers can be reclassified into each other, since the
+        // initial split (auto-detected from name shape) won't always be right
+        const moveTarget = type === 'keyword' ? 'performer' : (type === 'performer' ? 'keyword' : null);
+        const moveTitle = moveTarget === 'performer' ? 'Move to Performers' : 'Move to Keywords';
 
-        container.innerHTML = items.map((val, i) => `
+        const thumbHtml = `
+            <span class="performer-thumb-wrap">
+                <svg class="performer-thumb-placeholder" viewBox="0 0 24 24" aria-hidden="true">
+                    <circle cx="12" cy="8" r="4"></circle>
+                    <path d="M4 20c0-4.4 3.6-8 8-8s8 3.6 8 8"></path>
+                </svg>
+                <img class="performer-thumb" alt="">
+            </span>
+        `;
+
+        // Performers get a card (big photo on top, controls below) rather than
+        // the compact inline pill the other tag types use — a pill has no room
+        // for a photo that's actually visible. Both shapes share the same
+        // .keyword-tag/data-index/.tag-label contract so filter/sort/move/
+        // rename/remove wiring below works unchanged for either shape.
+        const itemHtml = (val, i) => type === 'performer' ? `
+            <span class="keyword-tag ${extraClass} performer-card" data-index="${i}">
+                <button class="remove-tag-btn" title="Remove">×</button>
+                ${thumbHtml}
+                <span class="tag-label" title="Click to rename">${this.escapeHtml(val)}</span>
+                <span class="performer-card-actions">
+                    <span class="tag-order">
+                        <button class="tag-move-btn" data-dir="up" title="Move up" ${i === 0 ? 'disabled' : ''}>▲</button>
+                        <button class="tag-move-btn" data-dir="down" title="Move down" ${i === items.length - 1 ? 'disabled' : ''}>▼</button>
+                    </span>
+                    <button class="change-photo-btn" title="Change photo">⟳</button>
+                    <button class="search-tag-btn" data-term="${this.escapeHtml(val)}" title="Search for ${this.escapeHtml(val)}">🔍</button>
+                    <button class="move-tag-btn" title="${moveTitle}">⇄</button>
+                </span>
+            </span>
+        ` : `
             <span class="keyword-tag ${extraClass}" data-index="${i}">
                 <span class="tag-order">
                     <button class="tag-move-btn" data-dir="up" title="Move up" ${i === 0 ? 'disabled' : ''}>▲</button>
                     <button class="tag-move-btn" data-dir="down" title="Move down" ${i === items.length - 1 ? 'disabled' : ''}>▼</button>
                 </span>
                 ${searchable ? `<button class="search-tag-btn" data-term="${this.escapeHtml(val)}" title="Search for ${this.escapeHtml(val)}">🔍</button>` : ''}
+                ${moveTarget ? `<button class="move-tag-btn" title="${moveTitle}">⇄</button>` : ''}
                 <span class="tag-label" title="Click to rename">${this.escapeHtml(val)}</span>
                 <button class="remove-tag-btn" title="Remove">×</button>
             </span>
-        `).join('');
+        `;
+
+        container.innerHTML = items.map(itemHtml).join('');
 
         container.querySelectorAll('.keyword-tag').forEach(tag => {
             const i = parseInt(tag.getAttribute('data-index'), 10);
@@ -2625,10 +3233,21 @@ class RSSParser {
                 const term = this._tagArrayFor(type)[i];
                 if (term) this.fetchPerformerSearch(term);
             });
+            tag.querySelector('.move-tag-btn')?.addEventListener('click', () => this.moveTagToOtherList(type, i));
             tag.querySelectorAll('.tag-move-btn').forEach(btn =>
                 btn.addEventListener('click', () => this.moveTagItem(type, i, btn.getAttribute('data-dir')))
             );
             tag.querySelector('.tag-label')?.addEventListener('click', (e) => this.startTagRename(e.currentTarget, type, i));
+
+            if (type === 'performer') {
+                const img = tag.querySelector('.performer-thumb');
+                const name = this._tagArrayFor(type)[i];
+                if (img && name) this.loadPerformerThumbnail(name, img);
+                tag.querySelector('.change-photo-btn')?.addEventListener('click', () => {
+                    const currentName = this._tagArrayFor('performer')[i];
+                    if (currentName) this.selectPerformerThumbnail(currentName);
+                });
+            }
         });
 
         this.applyTagFilter(type);
@@ -2640,7 +3259,21 @@ class RSSParser {
         // Delegate to the existing removers so their side-effects run
         if (type === 'favorite') this.removeFavoriteBrand(val);
         else if (type === 'exclude') this.removeExcludeKeyword(val);
+        else if (type === 'performer') this.removePerformer(val);
         else this.removeKeyword(val);
+    }
+
+    // Reclassify a tag between Keywords and Performers
+    moveTagToOtherList(type, index) {
+        const val = this._tagArrayFor(type)[index];
+        if (val === undefined) return;
+        if (type === 'performer') {
+            this.removePerformer(val);
+            this.addKeyword(val);
+        } else if (type === 'keyword') {
+            this.removeKeyword(val);
+            this.addPerformer(val);
+        }
     }
 
     moveTagItem(type, index, dir) {
@@ -2650,7 +3283,7 @@ class RSSParser {
         [arr[index], arr[j]] = [arr[j], arr[index]];
         this.saveArray(this._tagStorageKeyFor(type), arr);
         this.displayFavoritesAndKeywords();
-        if (type === 'keyword') this.applyKeywordHighlighting();
+        if (type === 'keyword' || type === 'performer') this.applyKeywordHighlighting();
         if (type === 'favorite' && this.brands.size > 0) this.displayResults();
     }
 
@@ -2676,7 +3309,7 @@ class RSSParser {
             if (save && val && val.toLowerCase() !== current.toLowerCase() && !duplicate) {
                 arr[index] = type === 'favorite' ? this.normalizeBrandName(val) : val;
                 this.saveArray(this._tagStorageKeyFor(type), arr);
-                if (type === 'keyword') this.applyKeywordHighlighting();
+                if (type === 'keyword' || type === 'performer') this.applyKeywordHighlighting();
                 if (type === 'favorite' && this.brands.size > 0) this.displayResults();
             }
             this.displayFavoritesAndKeywords();
@@ -2704,14 +3337,21 @@ class RSSParser {
         this.updateFavoritesStats();
 
         // Re-apply an active search after re-render
-        this.applyFavoritesSearch();
+        this.applyBrandListSearch('favorites-tab', 'favorites-search', 'favorites-search-status');
+    }
+
+    displayPerformers() {
+        this.displayPerformerMatchesSection();
+        this.updatePerformersStats();
+        this.applyBrandListSearch('performers-tab', 'performers-search', 'performers-search-status');
     }
 
     // Wire the Favorites tab search box and sort selector
     initializeFavoritesTools() {
         const searchInput = document.getElementById('favorites-search');
         if (searchInput) {
-            searchInput.addEventListener('input', () => this.applyFavoritesSearch());
+            searchInput.addEventListener('input', () =>
+                this.applyBrandListSearch('favorites-tab', 'favorites-search', 'favorites-search-status'));
         }
 
         const sortSelect = document.getElementById('favorites-sort');
@@ -2730,12 +3370,34 @@ class RSSParser {
         }
     }
 
-    // Order brand entries ({ name, latestDate, fileCount, cardHtml }) per the
-    // Favorites tab sort selector. "custom" keeps the caller's order (the
-    // user's favourites order / alphabetical for keyword matches).
-    sortFavoriteEntries(entries) {
-        const mode = this.favoritesSortMode || 'custom';
-        if (mode === 'custom') return entries;
+    // Wire the Performers tab search box and sort selector
+    initializePerformersTools() {
+        const searchInput = document.getElementById('performers-search');
+        if (searchInput) {
+            searchInput.addEventListener('input', () =>
+                this.applyBrandListSearch('performers-tab', 'performers-search', 'performers-search-status'));
+        }
+
+        const sortSelect = document.getElementById('performers-sort');
+        if (sortSelect) {
+            sortSelect.value = this.performersSortMode;
+            if (sortSelect.value !== this.performersSortMode) {
+                this.performersSortMode = 'custom';
+                sortSelect.value = 'custom';
+            }
+            sortSelect.addEventListener('change', () => {
+                this.performersSortMode = sortSelect.value;
+                localStorage.setItem('rssParserPerformersSort', this.performersSortMode);
+                this.displayPerformers();
+            });
+        }
+    }
+
+    // Order brand entries ({ name, latestDate, fileCount, cardHtml }) per a
+    // sort mode ("custom" keeps the caller's order — the user's favourites
+    // order, or alphabetical for keyword/performer matches).
+    sortEntriesByMode(entries, mode) {
+        if ((mode || 'custom') === 'custom') return entries;
 
         return [...entries].sort((a, b) => {
             if (mode === 'name-asc') return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
@@ -2746,15 +3408,23 @@ class RSSParser {
         });
     }
 
-    // Filter the rendered Favorites tab by brand or file name. Visibility-only,
-    // same approach as the Results tab search, but scoped to this tab. A brand
-    // name match shows all of that brand's files.
-    applyFavoritesSearch() {
-        const tab = document.getElementById('favorites-tab');
+    sortFavoriteEntries(entries) {
+        return this.sortEntriesByMode(entries, this.favoritesSortMode);
+    }
+
+    sortPerformerEntries(entries) {
+        return this.sortEntriesByMode(entries, this.performersSortMode);
+    }
+
+    // Filter a rendered brand-list tab (Favorites / Performers) by brand or
+    // file name. Visibility-only, same approach as the Results tab search,
+    // but scoped to the given tab. A brand name match shows all of that brand's files.
+    applyBrandListSearch(tabId, inputId, statusId) {
+        const tab = document.getElementById(tabId);
         if (!tab) return;
 
-        const input = document.getElementById('favorites-search');
-        const status = document.getElementById('favorites-search-status');
+        const input = document.getElementById(inputId);
+        const status = document.getElementById(statusId);
         const query = (input ? input.value : '').toLowerCase().trim();
 
         let visibleBrands = 0;
@@ -2795,7 +3465,7 @@ class RSSParser {
             }
         }
     }
-    
+
     displayFavoriteBrandsSection() {
         console.log('displayFavoriteBrandsSection called');
         const container = document.getElementById('favorite-brands-display');
@@ -2845,7 +3515,7 @@ class RSSParser {
                 const cardHtml = `
                     <div class="${brandClasses}" data-brand="${this.escapeHtml(brandName)}">
                         <div class="brand-header">
-                            <h3>${this.escapeHtml(brandName)} (${filesHTML.filteredFileCount} files)${isFullyDownloaded ? ' <span class="fully-downloaded-badge">✓ All Reviewed</span>' : ''}</h3>
+                            <h3>${this.escapeHtml(brandName)} (${this.fileCountLabel(filesHTML)})${isFullyDownloaded ? ' <span class="fully-downloaded-badge">✓ All Reviewed</span>' : ''}</h3>
                             <div class="brand-controls">
                                 <span class="brand-latest">${latestDate ? this.getTimeAgo(latestDate) : ''}</span>
                                 <button class="download-brand-btn" data-action="download-brand" data-brand="${this.escapeHtml(brandName)}" title="Download the whole brand — preferred size per group">⬇ All</button>
@@ -2960,7 +3630,7 @@ class RSSParser {
             const cardHtml = `
                 <div class="${brandClasses}" data-brand="${this.escapeHtml(brandName)}">
                     <div class="brand-header">
-                        <h3>${this.escapeHtml(brandName)} (${filesHTML.filteredFileCount} files)${isFullyDownloaded ? ' <span class="fully-downloaded-badge">✓ All Reviewed</span>' : ''}</h3>
+                        <h3>${this.escapeHtml(brandName)} (${this.fileCountLabel(filesHTML)})${isFullyDownloaded ? ' <span class="fully-downloaded-badge">✓ All Reviewed</span>' : ''}</h3>
                         <div class="brand-controls">
                             <span class="brand-latest">${latestDate ? this.getTimeAgo(latestDate) : ''}</span>
                             <button class="expand-btn" data-action="expand" data-brand="${this.escapeHtml(brandName)}">▼</button>
@@ -2977,7 +3647,108 @@ class RSSParser {
         container.innerHTML = this.sortFavoriteEntries(entries).map(e => e.cardHtml).join('');
         this.setupBrandEventDelegation(container);
     }
-    
+
+    displayPerformerMatchesSection() {
+        const container = document.getElementById('performer-matches-display');
+        if (!container) return;
+
+        if (!Array.isArray(this.performers) || this.performers.length === 0) {
+            container.innerHTML = '<p>No performers added yet. Search for a performer, or add one below.</p>';
+            return;
+        }
+
+        if (this.brands.size === 0) {
+            container.innerHTML = '<p>No RSS data loaded. Fetch an RSS feed first.</p>';
+            return;
+        }
+
+        // Find all files that match any performer
+        const matchingFiles = [];
+
+        this.brands.forEach((brandFiles, brandName) => {
+            brandFiles.forEach((files) => {
+                files.forEach(file => {
+                    const fileName = file.name.toLowerCase();
+                    const matchedPerformers = this.performers.filter(performer =>
+                        fileName.includes(performer.toLowerCase())
+                    );
+
+                    if (matchedPerformers.length > 0) {
+                        matchingFiles.push({
+                            ...file,
+                            brandName: brandName,
+                            matchedPerformers: matchedPerformers
+                        });
+                    }
+                });
+            });
+        });
+
+        if (matchingFiles.length === 0) {
+            container.innerHTML = `<p>No files match your performers: ${this.performers.join(', ')}</p>`;
+            return;
+        }
+
+        // Group by brand (parent category), then by baseName (file group) - same structure as results tab
+        const byBrand = new Map();
+        matchingFiles.forEach(file => {
+            const brandName = file.brandName;
+            if (!byBrand.has(brandName)) {
+                byBrand.set(brandName, new Map());
+            }
+            const brandFiles = byBrand.get(brandName);
+            const groupKey = this.getBaseNameGroupKey(file.baseName || this.extractBaseName(file.name));
+            if (!brandFiles.has(groupKey)) {
+                brandFiles.set(groupKey, []);
+            }
+            brandFiles.get(groupKey).push(file);
+        });
+
+        // Build brand cards with same structure as results tab (brand-item >
+        // brand-header > brand-files > file-groups). "Custom" sort falls back
+        // to alphabetical here since performer matches have no manual order.
+        const sortedBrands = Array.from(byBrand.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+        const entries = [];
+
+        sortedBrands.forEach(([brandName, brandFiles]) => {
+            const filesHTML = this.generateBrandFilesHTML(brandFiles);
+            const isFullyDownloaded = this.isBrandFullyDownloaded(brandFiles);
+            let latestDate = null;
+            brandFiles.forEach(files => {
+                files.forEach(file => {
+                    if (!latestDate || file.pubDate > latestDate) {
+                        latestDate = file.pubDate;
+                    }
+                });
+            });
+
+            const brandClasses = [
+                'brand-item',
+                'performer-matches-brand',
+                isFullyDownloaded ? 'fully-downloaded' : ''
+            ].filter(Boolean).join(' ');
+
+            const cardHtml = `
+                <div class="${brandClasses}" data-brand="${this.escapeHtml(brandName)}">
+                    <div class="brand-header">
+                        <h3>${this.escapeHtml(brandName)} (${this.fileCountLabel(filesHTML)})${isFullyDownloaded ? ' <span class="fully-downloaded-badge">✓ All Reviewed</span>' : ''}</h3>
+                        <div class="brand-controls">
+                            <span class="brand-latest">${latestDate ? this.getTimeAgo(latestDate) : ''}</span>
+                            <button class="expand-btn" data-action="expand" data-brand="${this.escapeHtml(brandName)}">▼</button>
+                        </div>
+                    </div>
+                    <div class="brand-files" style="display: none;">
+                        ${filesHTML.html}
+                    </div>
+                </div>
+            `;
+            entries.push({ name: brandName, latestDate, fileCount: filesHTML.filteredFileCount, cardHtml });
+        });
+
+        container.innerHTML = this.sortPerformerEntries(entries).map(e => e.cardHtml).join('');
+        this.setupBrandEventDelegation(container);
+    }
+
     highlightKeywords(text) {
         let highlightedText = this.escapeHtml(text);
         
@@ -3038,7 +3809,51 @@ class RSSParser {
             latestUpload.textContent = latestDate ? this.getTimeAgo(latestDate) : 'None';
         }
     }
-    
+
+    updatePerformersStats() {
+        const performersCountEl = document.getElementById('performers-count');
+        if (performersCountEl) {
+            performersCountEl.textContent = Array.isArray(this.performers) ? this.performers.length : 0;
+        }
+
+        // Count performer matches
+        let matchCount = 0;
+        if (Array.isArray(this.performers) && this.performers.length > 0) {
+            this.brands.forEach((brandFiles) => {
+                brandFiles.forEach((files) => {
+                    files.forEach(file => {
+                        const fileName = file.name.toLowerCase();
+                        if (this.performers.some(performer => fileName.includes(performer.toLowerCase()))) {
+                            matchCount++;
+                        }
+                    });
+                });
+            });
+        }
+
+        const matchesCountEl = document.getElementById('performer-matches-count');
+        if (matchesCountEl) {
+            matchesCountEl.textContent = matchCount;
+        }
+
+        // Update latest upload
+        let latestDate = null;
+        this.brands.forEach((brandFiles) => {
+            brandFiles.forEach((files) => {
+                files.forEach(file => {
+                    if (!latestDate || file.pubDate > latestDate) {
+                        latestDate = file.pubDate;
+                    }
+                });
+            });
+        });
+
+        const latestUpload = document.getElementById('performers-latest-upload');
+        if (latestUpload) {
+            latestUpload.textContent = latestDate ? this.getTimeAgo(latestDate) : 'None';
+        }
+    }
+
     displayExcludedFiles() {
         const container = document.getElementById('excluded-files-container');
         if (!container) return;

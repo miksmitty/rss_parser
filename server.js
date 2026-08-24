@@ -178,6 +178,73 @@ app.get('/api/sabnzb/status', (req, res) => {
     res.json({ configured });
 });
 
+// Performer thumbnail lookup. Scrapes thumbnailseries.com's performer page for
+// up to 10 distinct gallery thumbnail URLs and hands them back to the client,
+// which hotlinks whichever one is chosen directly - we never download or
+// store the image ourselves, only the resolved URL strings (in-memory,
+// cleared on restart).
+const THUMBNAIL_SOURCE_BASE = 'https://www.thumbnailseries.com';
+const THUMBNAIL_OPTION_COUNT = 10;
+const performerThumbnailsCache = new Map(); // lowercased name -> array of image URLs
+
+function slugifyPerformerName(name) {
+    return name
+        .toLowerCase()
+        .replace(/\./g, ' ') // NZB-style names use dots as separators
+        .trim()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+}
+
+app.get('/api/performer-thumbnails', async (req, res) => {
+    const name = req.query.name;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+        return res.status(400).json({ error: 'name is required' });
+    }
+
+    const cacheKey = name.trim().toLowerCase();
+    if (performerThumbnailsCache.has(cacheKey)) {
+        return res.json({ imageUrls: performerThumbnailsCache.get(cacheKey) });
+    }
+
+    const slug = slugifyPerformerName(name);
+    if (!slug) {
+        return res.json({ imageUrls: [] });
+    }
+
+    try {
+        const pageUrl = `${THUMBNAIL_SOURCE_BASE}/pornstars/${slug}/`;
+        const response = await fetch(pageUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; RSSParser/1.0)' }
+        });
+
+        if (!response.ok) {
+            // A stable "no such performer page" result is worth caching;
+            // don't cache below on genuine network errors so those can retry
+            performerThumbnailsCache.set(cacheKey, []);
+            return res.json({ imageUrls: [] });
+        }
+
+        const html = await response.text();
+        const matches = html.matchAll(/["'](\/tgpx\/thumbs\/[^"']+\.(?:jpg|jpeg|png|webp))["']/gi);
+        const seen = new Set();
+        const imageUrls = [];
+        for (const m of matches) {
+            const url = `${THUMBNAIL_SOURCE_BASE}${m[1]}`;
+            if (seen.has(url)) continue;
+            seen.add(url);
+            imageUrls.push(url);
+            if (imageUrls.length >= THUMBNAIL_OPTION_COUNT) break;
+        }
+
+        performerThumbnailsCache.set(cacheKey, imageUrls);
+        res.json({ imageUrls });
+    } catch (err) {
+        console.error('Performer thumbnail lookup error:', err.message);
+        res.json({ imageUrls: [] });
+    }
+});
+
 // Performer / NZBGeek search (Newznab-compatible API)
 app.get('/api/search', async (req, res) => {
     if (!NZBGEEK_API_KEY) {

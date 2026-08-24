@@ -38,21 +38,28 @@
                 <div class="control-panel">
                     <h4 class="control-panel-title">Search</h4>
                     <div class="performer-search-section">
-                        <label for="performer-search">Performer search</label>
+                        <label for="performer-search">Feed search</label>
                         <div class="performer-search-row">
-                            <input type="text" id="performer-search" placeholder="e.g. Sophie Tyler" autocomplete="off" class="performer-search-input">
+                            <input type="text" id="performer-search" placeholder="Performer name or keyword" autocomplete="off" class="performer-search-input">
                             <button type="button" id="performer-search-btn" class="btn btn-primary">Search</button>
                         </div>
-                        <label class="save-search-option" title="Add this search term to the quick search list">
-                            <input type="checkbox" id="save-search-term" checked>
-                            <span>Save search term to quick search</span>
-                        </label>
+                        <div class="save-search-option-row">
+                            <label class="save-search-option" title="Save this search term for quick access later">
+                                <input type="checkbox" id="save-search-term" checked>
+                                <span>Save search term as</span>
+                            </label>
+                            <select id="save-search-term-type" class="save-search-type-select" title="Which list to save this term to">
+                                <option value="performer">Performer</option>
+                                <option value="keyword">Keyword</option>
+                                <option value="none">Do not add</option>
+                            </select>
+                        </div>
                     </div>
 
                     <div class="quick-search" id="quick-search" hidden>
                         <button type="button" class="quick-search-toggle" id="quick-search-toggle" aria-expanded="false">
                             <span class="qs-chevron">▸</span>
-                            <span>Quick search from favourites &amp; keywords</span>
+                            <span>Quick search from favourites, performers &amp; keywords</span>
                             <span class="qs-count" id="quick-search-count"></span>
                         </button>
                         <div class="quick-search-chips" id="quick-search-chips" hidden></div>
@@ -107,6 +114,7 @@
                     <div class="button-group">
                         <button id="clear-btn" class="btn btn-secondary">Clear</button>
                         <button id="load-sample-btn" class="btn btn-secondary">Load Sample</button>
+                        <button id="redownload-btn" class="btn btn-secondary" title="Re-download files you've previously downloaded — e.g. after an accidental deletion">Redownload recent</button>
                         <button id="clear-sabnzb-history-btn" class="btn btn-secondary sabnzb-history-btn" title="Clear all completed/failed items in SABnzbd history" style="display: none;">Clear SABnzb history</button>
                         <button id="restart-server-btn" class="btn btn-secondary" title="Restart the Node server">Restart server</button>
                     </div>
@@ -118,6 +126,7 @@
                 <div class="tabs-header">
                     <button class="tab-btn active" data-tab="results">Results</button>
                     <button class="tab-btn" data-tab="favorites">Favorites</button>
+                    <button class="tab-btn" data-tab="performers">Performers</button>
                     <button class="tab-btn" data-tab="management">Favorites & Keywords</button>
                     <button class="tab-btn" data-tab="excluded">Excluded Files</button>
                 </div>
@@ -202,11 +211,72 @@
                     </div>
                 </div>
                 
+                <div class="tab-content" id="performers-tab">
+                    <div class="favorites-display-section">
+                        <div class="favorites-header">
+                            <h3>Performers</h3>
+                            <p>Manage performer names and see files that match them</p>
+                        </div>
+
+                        <div class="favorites-stats">
+                            <div class="stat-item">
+                                <span class="stat-label">Performers:</span>
+                                <span class="stat-value" id="performers-count">0</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">Matches:</span>
+                                <span class="stat-value" id="performer-matches-count">0</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">Latest Upload:</span>
+                                <span class="stat-value" id="performers-latest-upload">None</span>
+                            </div>
+                        </div>
+
+                        <div class="favorites-section-full">
+                            <h4>Manage Performers</h4>
+                            <div class="tag-list-tools">
+                                <input type="text" class="tag-filter-input" data-type="performer" placeholder="Search performers...">
+                                <button class="tag-sort-btn" data-type="performer" title="Sort alphabetically">A→Z</button>
+                            </div>
+                            <div class="performers-list" id="performers-list">
+                                <!-- Performer tags will be populated here -->
+                            </div>
+                            <div class="add-performer-form">
+                                <input type="text" id="add-performer-input" placeholder="Enter performer name">
+                                <button id="add-performer-btn" class="btn btn-primary">Add Performer</button>
+                            </div>
+                        </div>
+
+                        <div class="search-section favorites-toolbar">
+                            <input type="text" id="performers-search" placeholder="Search by brand or file name..." class="search-input">
+                            <label for="performers-sort" class="favorites-sort-label">Sort:</label>
+                            <select id="performers-sort">
+                                <option value="custom">My order</option>
+                                <option value="name-asc">Name A→Z</option>
+                                <option value="name-desc">Name Z→A</option>
+                                <option value="latest">Latest upload</option>
+                                <option value="files">Most files</option>
+                            </select>
+                            <span class="search-status" id="performers-search-status"></span>
+                        </div>
+
+                        <div class="favorites-content-full">
+                            <div class="favorites-section-full">
+                                <h4>Performer Matches</h4>
+                                <div class="performer-matches-display" id="performer-matches-display">
+                                    <!-- Performer matches will be populated here -->
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="tab-content" id="management-tab">
                     <div class="favorites-section">
                         <div class="favorites-header">
                             <h3>Favorites & Keywords Management</h3>
-                            <p>Manage your favorite brands and keywords for highlighting and excluding files</p>
+                            <p>Manage your favorite brands and general keywords for highlighting and excluding files. Performer names have their own tab.</p>
                         </div>
                         
                         <div class="favorites-content">
