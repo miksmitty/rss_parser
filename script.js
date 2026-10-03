@@ -4000,6 +4000,16 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
         window.rssParser = new RSSParser();
         console.log('RSSParser ready!');
+
+        // Deep link: /?altq=<filename> runs an alternate-quality search for
+        // that filename on load (used by the IINA color-tag plugin's hotkey
+        // to send the currently playing video here). The param is cleared
+        // from the URL so a reload doesn't re-run the search.
+        const altq = new URLSearchParams(window.location.search).get('altq');
+        if (altq) {
+            history.replaceState(null, '', window.location.pathname);
+            window.rssParser.searchAlternateQuality(altq);
+        }
         
         // Test if elements exist
         console.log('Testing elements:');
