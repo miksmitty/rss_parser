@@ -1163,66 +1163,265 @@ class RSSParser {
         }
     }
 
+    // Grammar/title words that end the performer-name zone of a filename.
+    static NAME_STOPWORDS = new Set([
+        'a', 'an', 'and', 'the', 'of', 'in', 'on', 'at', 'is', 'are', 'was',
+        'be', 'to', 'for', 'with', 'from', 'by', 'or', 'not', 'my', 'your',
+        'his', 'her', 'their', 'our', 'its', 'it', 'as', 'vs', 'too', 'many',
+        'part', 'episode', 'ep', 'scene', 'when', 'who', 'what', 'where',
+        'how', 'out', 'up', 'about', 'gets', 'get', 'has', 'have', 'does', 'do',
+        'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+        'old', 'young', 'man', 'woman', 'men', 'women',
+        'we', 'you', 'i', 'me', 'she', 'he', 'they', 'them', 'this', 'that',
+        'these', 'those', 'should', 'would', 'could', 'will', 'can', 'just',
+        'so', 'all', 'if', 'but', 'because', 'than', 'then', 'there', 'here',
+        'after', 'before', 'over', 'under', 'into', 'off', 'down', 'more',
+        'most', 'some', 'both', 'each'
+    ]);
+
+    // Genre/role tokens: they end the name zone like a stopword, but a single
+    // name word sitting right before one is trusted (e.g. "Jadilica XXX",
+    // "LybovNTV Masturbation").
+    static GENRE_WORDS = new Set([
+        'hardcore', 'anal', 'solo', 'masturbation', 'lesbian', 'interracial',
+        'gangbang', 'threesome', 'foursome', 'orgy', 'creampie', 'facial',
+        'blowjob', 'bj', 'pov', 'milf', 'gilf', 'teen', 'amateur', 'mature',
+        'granny', 'casting', 'castings', 'compilation', 'internal', 'remastered',
+        'step', 'stepmom', 'stepdad', 'stepsister', 'stepbrother', 'stepson',
+        'stepdaughter', 'mom', 'mommy', 'dad', 'daddy', 'daughter', 'son',
+        'sister', 'brother', 'wife', 'husband', 'housewife', 'girl', 'girls',
+        'boy', 'boys', 'sexy', 'busty', 'petite', 'skinny', 'bbw', 'latina',
+        'ebony', 'asian', 'blonde', 'brunette', 'redhead',
+        'sex', 'porn', 'fuck', 'fucking', 'fucked', 'pussy', 'tits', 'boobs',
+        'ass', 'cum', 'naked', 'nude', 'horny', 'slut', 'nurse', 'double',
+        'penetrated', 'penetration', 'dp', 'licking', 'oral', 'shower',
+        'worship', 'massage', 'orgasm', 'orgasms', 'foot', 'feet', 'breast'
+    ]);
+
+    static EPISODE_WORDS = new Set(['episode', 'ep', 'scene']);
+
     /**
-     * Pull every performer's name out of an NZB-style filename, in filename
-     * order. Two passes: known names first (any saved performer whose words
-     * appear consecutively in the filename; where matches overlap - "Lily"
-     * saved alongside "Lily Lou" - the longer span wins), then the
-     * scene-release convention of Firstname.Lastname pairs chained with
-     * "And" directly after the YY.MM.DD date token
-     * (Brand.24.09.28.Freya.Parker.And.Lily.Lou.Title...). Returns [] rather
-     * than a low-confidence guess - the caller decides the fallback.
+     * Pull every performer's name out of a release-style filename, in
+     * filename order, plus a confidence flag the caller uses to decide
+     * between searching straight away and showing the chooser.
+     *
+     * Passes: saved performers first (consecutive-word match; on overlapping
+     * matches - "Lily" saved alongside "Lily Lou" - the longer span wins),
+     * then a forward scan of the name zone after the date token (YY.MM.DD,
+     * YYYY.MM.DD or a lone year; from the start when there is none),
+     * segmenting capitalised runs on stopwords/genre words and chaining
+     * performers through "And", and finally - for series-titled names that
+     * put the cast at the END (Brand.17.01.04.Series.Episode.1.Title.Name.
+     * Name.4k) - a backward scan from the quality block. All-lowercase
+     * filenames are handled by dropping the capitalisation requirement.
+     * Returns { names: [], confident: false } rather than a low-confidence
+     * guess - the caller decides the fallback.
      */
-    extractPerformersFromFilename(filename) {
-        if (!filename) return [];
-        let name = filename.replace(/\.[A-Za-z0-9]{2,4}$/, ''); // real file extension
-        name = name.replace(/-[A-Za-z0-9]{2,10}$/, ''); // trailing release-group tag
-        const words = name.split(/[\.\-_\s\[\]]+/).filter(Boolean);
+    extractPerformersFromFilenameDetailed(filename) {
+        if (!filename) return { names: [], confident: false };
+        let name = filename.replace(/\.[A-Za-z0-9]{2,4}$/, '');   // real file extension
+        name = name.replace(/\[[^\]]*\]/g, ' ');                   // [XvX]-style tags
+        name = name.replace(/-[A-Za-z0-9]{2,10}$/, '');            // trailing release-group tag
+        const words = name.split(/[\.\-_\s]+/).filter(Boolean);
         const lowerWords = words.map(w => w.toLowerCase());
 
         const spansOverlap = (a, b) => a.start < b.start + b.len && b.start < a.start + a.len;
 
-        const found = [];
-        for (const performer of this.performers) {
-            const pw = performer.toLowerCase().split(/\s+/).filter(Boolean);
-            if (pw.length === 0) continue;
-            for (let i = 0; i + pw.length <= lowerWords.length; i++) {
-                if (pw.every((w, j) => lowerWords[i + j] === w)) {
-                    found.push({ name: performer, start: i, len: pw.length });
-                    break;
+        // ---- pass 1: saved performers (canonical spellings win) ----
+        const kept = [];
+        let savedMatch = false;
+        {
+            const found = [];
+            for (const performer of this.performers) {
+                const pw = performer.toLowerCase().split(/\s+/).filter(Boolean);
+                if (pw.length === 0) continue;
+                for (let i = 0; i + pw.length <= lowerWords.length; i++) {
+                    if (pw.every((w, j) => lowerWords[i + j] === w)) {
+                        found.push({ name: performer, start: i, len: pw.length });
+                        break;
+                    }
                 }
             }
-        }
-        // Longest span first, so "Lily Lou" claims its words before "Lily"
-        found.sort((a, b) => b.len - a.len || a.start - b.start);
-        const kept = [];
-        for (const m of found) {
-            if (!kept.some(k => spansOverlap(m, k))) kept.push(m);
+            // Longest span first, so "Lily Lou" claims its words before "Lily"
+            found.sort((a, b) => b.len - a.len || a.start - b.start);
+            for (const m of found) {
+                if (!kept.some(k => spansOverlap(m, k))) kept.push(m);
+            }
+            savedMatch = kept.length > 0;
         }
 
-        const isNameWord = w => /^[A-Z][a-zA-Z'-]*$/.test(w) &&
-            !RSSParser.ALT_QUALITY_STRIP_TOKENS.has(w.toLowerCase());
-        const dateIdx = words.findIndex((w, i) =>
-            /^\d{2}$/.test(w) && /^\d{2}$/.test(words[i + 1] || '') && /^\d{2}$/.test(words[i + 2] || ''));
-        if (dateIdx !== -1) {
-            let i = dateIdx + 3;
-            while (i + 1 < words.length && isNameWord(words[i]) && isNameWord(words[i + 1]) &&
-                words[i + 1].toLowerCase() !== 'and') {
-                const candidate = { name: words[i] + ' ' + words[i + 1], start: i, len: 2 };
-                // A saved performer already claiming (part of) these words
-                // takes priority - its canonical spelling is better anyway
-                if (!kept.some(k => spansOverlap(candidate, k))) kept.push(candidate);
-                if ((words[i + 2] || '').toLowerCase() !== 'and') break;
-                i += 3;
+        // ---- shared helpers ----
+        // All-lowercase releases carry no case signal, so capitalisation
+        // can't be required of their name words.
+        const hasCaseSignal = words.some(w => /^[A-Z][a-z]/.test(w));
+        const stem = w => w.toLowerCase().replace(/'s$/, ''); // Granny's -> granny
+        const isStrip = w => RSSParser.ALT_QUALITY_STRIP_TOKENS.has(w.toLowerCase());
+        const isStop = w => RSSParser.NAME_STOPWORDS.has(stem(w));
+        const isGenre = w => RSSParser.GENRE_WORDS.has(stem(w));
+        const isAnd = w => /^(and|&)$/i.test(w);
+        // Brand-style tokens: CamelCase (MommysGirl), acronyms (POV), digits (Mommy4k)
+        const isBrandish = w => /[a-z0-9][A-Z]/.test(w) || /^[A-Z]{2,}$/.test(w) || /\d/.test(w);
+        const isNameWord = w => {
+            if (isStrip(w) || isStop(w) || isGenre(w) || /\d/.test(w)) return false;
+            if (/^[A-Z]{2,}$/.test(w)) return false; // POV, GF, NT ...
+            if (hasCaseSignal) return /^[A-Z][a-zA-Z'-]*$/.test(w);
+            return /^[a-z][a-z'-]*$/.test(w);
+        };
+        const titleCase = w => hasCaseSignal ? w : w.charAt(0).toUpperCase() + w.slice(1);
+        const makeName = (start, len) =>
+            ({ name: words.slice(start, start + len).map(titleCase).join(' '), start, len });
+        const addSpan = (span) => {
+            if (span.allowOverlap || !kept.some(k => spansOverlap(span, k))) kept.push(span);
+        };
+
+        // ---- date anchor: YY MM DD, YYYY MM DD, or a lone 19xx/20xx year ----
+        let anchor = -1;
+        for (let i = 0; i < words.length; i++) {
+            const w = words[i];
+            if ((/^\d{2}$/.test(w) || /^(19|20)\d{2}$/.test(w)) &&
+                /^\d{2}$/.test(words[i + 1] || '') && /^\d{2}$/.test(words[i + 2] || '')) {
+                anchor = i + 3;
+                break;
+            }
+            if (/^(19|20)\d{2}$/.test(w) && anchor === -1) anchor = i + 1; // lone year; keep looking for a full date
+        }
+
+        /**
+         * Scan forward from `from`, emitting performer spans. Skips non-name
+         * tokens until the first run starts; after that the first stopword,
+         * genre word, number or strip token ends the zone - except "And",
+         * which continues to the next performer when the run so far parses
+         * cleanly (even word count, or a lone single name).
+         */
+        const scanForward = (from) => {
+            const spans = [];
+            let i = from;
+            // Skip leading junk: episode markers, numbers, stopwords - and,
+            // when scanning from the very start of an undated name, the brand
+            // token (MommysGirl, IntimatePOV, ...). After a date, CamelCase is
+            // kept: there it's usually a one-word alias, not a brand.
+            let sawTitleJunk = false;
+            while (i < words.length && (!isNameWord(words[i]) || (from === 0 && isBrandish(words[i])))) {
+                if (isStrip(words[i])) return { spans: [], episodeTitle: false }; // quality block: zone over
+                if (RSSParser.EPISODE_WORDS.has(stem(words[i]))) {
+                    // "Episode 478 Lola Grant" right after the date is a marker
+                    // to skip; "All About Me Episode 3 ..." is a series title,
+                    // and the performers sit at the END of the name
+                    if (sawTitleJunk) return { spans: [], episodeTitle: true };
+                } else if (!/^\d+$/.test(words[i])) {
+                    sawTitleJunk = true;
+                }
+                i++;
+            }
+            let afterAnd = false;
+            let anchoredStart = (anchor !== -1 && i >= anchor);
+            while (i < words.length) {
+                const runStart = i;
+                while (i < words.length && isNameWord(words[i]) && !isAnd(words[i])) i++;
+                const runLen = i - runStart;
+                if (runLen === 0) break;
+                const term = i < words.length ? words[i] : null;
+                // "Vox Reloaded Episode 3 ..." - the run was a series title,
+                // and the performers sit at the END of the name (scanBackward)
+                if (term !== null && RSSParser.EPISODE_WORDS.has(stem(term))) {
+                    return { spans: [], episodeTitle: true };
+                }
+                const termIsAnd = term !== null && isAnd(term);
+                const termTrusted = term === null || isStrip(term) || isGenre(term);
+
+                if (runLen % 2 === 0) {
+                    for (let s = runStart; s < i; s += 2) spans.push(makeName(s, 2));
+                } else if (runLen === 1 && (termTrusted || termIsAnd || afterAnd)) {
+                    // lone stage name right before XXX/genre, before an "And"
+                    // ("Cathi And Jessie Ames"), or right after one ("...And Jadilica")
+                    spans.push(makeName(runStart, 1));
+                } else if (runLen === 3 && termTrusted && (anchoredStart || afterAnd)) {
+                    // Three words filling the whole name zone: either a 3-word
+                    // name (Kenza Del Cairo) or pair + title word (Violet Voss
+                    // Absolution). Offer both readings; the chooser disambiguates.
+                    spans.push(makeName(runStart, 3));
+                    spans.push({ ...makeName(runStart, 2), allowOverlap: true });
+                } else {
+                    for (let s = runStart; s + 1 < runStart + runLen; s += 2) spans.push(makeName(s, 2));
+                    break; // odd leftover word = the title has started
+                }
+
+                if (!termIsAnd) break; // stopword/genre/number/strip/end: zone over
+                i++; // step past the And
+                afterAnd = true;
+                anchoredStart = false;
+                if (i < words.length && !isNameWord(words[i])) break;
+            }
+            return { spans, episodeTitle: false };
+        };
+
+        /**
+         * Scan backward from just before the first quality/strip token - some
+         * releases (Viv Thomas style) put the performers at the END of the
+         * title. Only pairs are trusted here, aligned to the end of the run;
+         * an odd leading word belongs to the title and is dropped.
+         */
+        const scanBackward = () => {
+            // In surname position the usual filters mislabel real stage names
+            // ("Penelope Cum", "Melody Petite", "Zafira A"), so be lenient
+            // here: genre words and single capitals count as name words.
+            const isBackNameWord = w => isNameWord(w) || /^[A-Z]$/.test(w) ||
+                (isGenre(w) && /^[A-Z][a-z]/.test(w));
+            let end = words.findIndex(w => isStrip(w) || /^\d{3,4}p$/i.test(w));
+            if (end === -1) end = words.length;
+            let i = end - 1;
+            while (i >= 0 && /^\d+$/.test(words[i])) i--; // trailing scene numbers
+            const runEnd = i;
+            while (i >= 0 && isBackNameWord(words[i]) && !isAnd(words[i])) i--;
+            const runLen = runEnd - i;
+            if (runLen < 2) return [];
+            const spans = [];
+            let s = runEnd - 1;
+            while (s > i) { // pairs aligned to the end; odd first word dropped
+                // A pair starting with a single capital or a genre word ("A
+                // Kiss", "Pussy Worship") is the tail of the title - and so
+                // is everything before it
+                if (/^[A-Z]$/.test(words[s]) || isGenre(words[s])) break;
+                spans.push(makeName(s, 2));
+                s -= 2;
+            }
+            return spans.reverse();
+        };
+
+        const scanStart = anchor !== -1 ? anchor : 0;
+        const fw = scanForward(scanStart);
+        let heuristic = fw.spans;
+        // A series marker (Episode/Part/Scene) with every forward find BEFORE
+        // it means the forward scan read the series title, not the cast - the
+        // performers sit at the end of the name (Viv Thomas style)
+        const seriesIdx = words.findIndex((w, idx) => idx >= scanStart &&
+            (RSSParser.EPISODE_WORDS.has(stem(w)) || stem(w) === 'part'));
+        const seriesTitled = fw.episodeTitle ||
+            (seriesIdx !== -1 && heuristic.length > 0 && heuristic.every(sp => sp.start < seriesIdx));
+        if (seriesTitled || heuristic.length === 0) {
+            const bw = scanBackward();
+            if (bw.length > 0) {
+                heuristic = bw;
+            } else if (heuristic.length === 0 && anchor !== -1 && !fw.episodeTitle) {
+                // Last resort for a dated name whose performers precede the
+                // date (Kati-Loritzo-NT-09-16-24-4K) - but not for an
+                // episode-titled one, where a from-0 scan would only pick up
+                // the site name.
+                heuristic = scanForward(0).spans;
             }
         }
+        for (const s of heuristic) addSpan(s);
 
         kept.sort((a, b) => a.start - b.start);
         const names = [];
         for (const k of kept) {
             if (!names.some(n => n.toLowerCase() === k.name.toLowerCase())) names.push(k.name);
         }
-        return names;
+        return { names: names.slice(0, 6), confident: anchor !== -1 || savedMatch };
+    }
+
+    extractPerformersFromFilename(filename) {
+        return this.extractPerformersFromFilenameDetailed(filename).names;
     }
 
     /**
@@ -1289,18 +1488,23 @@ class RSSParser {
     /**
      * /?performer=<filename> deep link (IINA color-tag plugin's ⌥P): pull
      * the performers' names out of the playing file's name and run the
-     * main performer search. One name searches straight away; several
-     * bring up the photo chooser (showPerformerChooser) to pick who to
-     * search for. Only that chosen performer is added to the Performers
+     * main performer search. A single confidently-extracted name searches
+     * straight away; several names, or a shaky single, bring up the photo
+     * chooser (showPerformerChooser) to pick who to search for. Only that chosen performer is added to the Performers
      * list (with their thumbnail picker if new) - and only once the
      * search has found results, so a misread name doesn't land in the
      * list. Saving bypasses fetchPerformerSearch's own save path, whose
      * checkbox/type dropdown govern manual searches.
      */
     async searchPerformerFromFilename(filename) {
-        const names = this.extractPerformersFromFilename(filename);
+        const { names, confident } = this.extractPerformersFromFilenameDetailed(filename);
         if (names.length > 0) {
-            const chosen = names.length === 1 ? names[0] : await this.showPerformerChooser(names);
+            // A single confident name (dated filename or saved performer)
+            // searches straight away; anything shakier goes through the
+            // photo chooser so a misread never searches or saves unseen.
+            const chosen = (names.length === 1 && confident)
+                ? names[0]
+                : await this.showPerformerChooser(names);
             if (!chosen) return; // chooser dismissed
             await this.fetchPerformerSearch(chosen, { save: false });
             if (this.brands.size > 0) await this.addPerformer(chosen);
