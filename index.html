@@ -118,6 +118,10 @@
                         <button id="clear-sabnzb-history-btn" class="btn btn-secondary sabnzb-history-btn" title="Clear all completed/failed items in SABnzbd history" style="display: none;">Clear SABnzb history</button>
                         <button id="restart-server-btn" class="btn btn-secondary" title="Restart the Node server">Restart server</button>
                     </div>
+                    <label class="save-search-option file-drop-toggle" title="When on, dragging a file (e.g. one you've already downloaded) anywhere onto the page searches for it in another quality">
+                        <input type="checkbox" id="enable-file-drop-search">
+                        <span>Enable drag file to search alternate quality</span>
+                    </label>
                 </div>
             </aside>
 
@@ -150,6 +154,7 @@
                             <label class="hide-fully-reviewed-option">
                                 <input type="checkbox" id="hide-fully-reviewed" value="1"> Hide fully reviewed
                             </label>
+                            <button id="download-all-btn" class="btn btn-secondary download-all-btn" title="Download the preferred size from every brand">⬇ Download All</button>
                         </div>
                         
                         <div class="brands-container" id="brands-container">
@@ -362,7 +367,14 @@
     </div>
 
     <button type="button" id="scroll-to-top-btn" class="scroll-to-top-btn" title="Scroll to top" aria-label="Scroll to top"><span class="stt-arrow">↑</span> Back to top</button>
-    
+
+    <div id="file-drop-overlay" class="file-drop-overlay" hidden>
+        <div class="file-drop-overlay-inner">
+            <div class="file-drop-icon">⇩</div>
+            <p>Drop file to search for alternate quality</p>
+        </div>
+    </div>
+
     <script src="script.js"></script>
 </body>
 </html>

@@ -162,6 +162,10 @@ body {
     cursor: pointer;
 }
 
+.file-drop-toggle {
+    margin-top: 10px;
+}
+
 .save-search-type-select {
     padding: 2px 6px;
     border: 1px solid #d0d7de;
@@ -609,10 +613,10 @@ body {
 
 .performers-list {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
     gap: 14px;
     margin-bottom: 20px;
-    max-height: 480px;
+    max-height: 900px;
     overflow-y: auto;
     padding: 4px;
 }
@@ -1222,6 +1226,17 @@ body {
     cursor: pointer;
 }
 
+.download-all-btn {
+    padding: 8px 14px;
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+
+.download-all-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
 /* File Age Indicators */
 .file-age {
     display: inline-block;
@@ -1391,6 +1406,44 @@ body {
     cursor: default;
 }
 
+/* Drag-a-file-onto-the-app overlay: dropping searches for alternate quality */
+.file-drop-overlay {
+    display: none;
+}
+
+.file-drop-overlay:not([hidden]) {
+    position: fixed;
+    inset: 0;
+    z-index: 2000;
+    background: rgba(102, 126, 234, 0.15);
+    backdrop-filter: blur(2px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+}
+
+.file-drop-overlay-inner {
+    background: #fff;
+    border: 3px dashed #667eea;
+    border-radius: 16px;
+    padding: 48px 64px;
+    text-align: center;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
+}
+
+.file-drop-icon {
+    font-size: 2.5rem;
+    color: #667eea;
+    margin-bottom: 8px;
+}
+
+.file-drop-overlay-inner p {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #495057;
+}
+
 /* Whole-brand download confirmation dialog */
 .bdc-overlay {
     position: fixed;
@@ -1541,6 +1594,18 @@ body {
     font-variant-numeric: tabular-nums;
 }
 
+.bdc-file-brand {
+    display: inline-block;
+    margin-right: 8px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: #eef1ff;
+    color: #5a6bdc;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
 .bdc-actions {
     display: flex;
     justify-content: flex-end;
@@ -1576,17 +1641,42 @@ body {
     background: #218838;
 }
 
+/* Alternate-quality search results (shares the .bdc- modal shell) - every
+   row is fully actionable, deliberately with no excluded/downloaded styling */
+.aqr-dialog {
+    max-width: 720px;
+}
+
+.aqr-term {
+    font-size: 13px;
+    color: #6c757d;
+    margin-bottom: 12px;
+}
+
+.aqr-term strong {
+    color: #495057;
+}
+
+.aqr-list {
+    overflow-y: auto;
+    border: 1px solid #e9ecef;
+    border-radius: 6px;
+    flex: 1;
+    min-height: 0;
+    margin-bottom: 15px;
+}
+
 /* Performer thumbnail picker (shares the .bdc- modal shell) */
 .ptp-dialog {
-    max-width: 600px;
+    max-width: 960px;
 }
 
 .ptp-options {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
     gap: 10px;
     margin-bottom: 16px;
-    max-height: 340px;
+    max-height: 560px;
     overflow-y: auto;
     padding: 2px;
 }
@@ -1612,12 +1702,88 @@ body {
     width: 100%;
     height: 100%;
     object-fit: cover;
+    object-position: center top;
+}
+
+.ptp-approx {
+    margin: 0 0 12px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    background: #fff8e6;
+    border: 1px solid #f0c36d;
+    color: #7a5a00;
+    font-size: 13px;
 }
 
 .ptp-empty {
     color: #6c757d;
     font-size: 14px;
     margin: 0 0 16px;
+}
+
+/* Performer chooser (⌥P deep link with several names in the filename;
+   shares the .bdc- modal shell like the thumbnail picker above) */
+.pch-dialog {
+    max-width: 680px;
+}
+
+.pch-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+    max-height: 560px;
+    overflow-y: auto;
+    padding: 2px;
+}
+
+.pch-card {
+    border: 2px solid #e1e5e9;
+    border-radius: 8px;
+    background: none;
+    cursor: pointer;
+    overflow: hidden;
+    padding: 0 0 10px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.pch-card:hover {
+    border-color: #667eea;
+    transform: scale(1.03);
+}
+
+.pch-card img,
+.pch-placeholder {
+    display: block;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    object-fit: cover;
+    object-position: center top;
+}
+
+.pch-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #f0f2f5;
+    color: #adb5bd;
+    font-size: 56px;
+    font-weight: 600;
+}
+
+.pch-name {
+    font-weight: 600;
+    color: #495057;
+    font-size: 14px;
+    padding: 0 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
 }
 
 .ptp-custom {
@@ -2489,6 +2655,7 @@ body {
     width: 100%;
     height: 100%;
     object-fit: cover;
+    object-position: center top;
     opacity: 0;
     transition: opacity 0.2s ease;
 }
@@ -2627,4 +2794,35 @@ body {
     border-radius: 4px;
     width: 120px;
     outline: none;
+}
+
+/* Hover preview for performer names in the Quick search panel */
+.performer-hover-popup {
+    position: fixed;
+    z-index: 2000;
+    width: 240px;
+    background: #fff;
+    border: 1px solid #c8ced9;
+    border-radius: 10px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+    overflow: hidden;
+    pointer-events: none;
+}
+
+.performer-hover-photo {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    aspect-ratio: 2 / 3;
+    background: #dfe3ea;
+}
+
+.performer-hover-name {
+    padding: 8px 10px;
+    font-size: 13px;
+    font-weight: 600;
+    text-align: center;
+    color: #333;
 }

@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const path = require('path');
+const fs = require('fs');
 const https = require('https');
 const http = require('http');
 const { URL } = require('url');
@@ -11,6 +12,49 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Downloaded/ignored-file tracking lives here instead of the browser's
+// localStorage — that has a hard per-origin quota (~5-10MB) with no
+// pruning, so it silently stopped saving once the history grew large
+// enough, and it was tied to one browser profile anyway. A server-side
+// file has no such ceiling and is shared across every browser/device
+// that hits this server.
+const DATA_DIR = path.join(__dirname, 'data');
+const DOWNLOADED_FILE = path.join(DATA_DIR, 'downloaded-files.json');
+const IGNORED_FILE = path.join(DATA_DIR, 'ignored-files.json');
+
+function readJsonFile(filePath) {
+    try {
+        if (!fs.existsSync(filePath)) return {};
+        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        return (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch (err) {
+        console.error(`Error reading ${filePath}:`, err.message);
+        return {};
+    }
+}
+
+// Writes are chained onto this promise so concurrent requests (e.g. a
+// "Download All" batch) can't interleave and corrupt the file, and each
+// write lands via a temp-file rename so a crash mid-write can't either.
+let historyWriteQueue = Promise.resolve();
+function writeJsonFile(filePath, data) {
+    const result = historyWriteQueue.then(() => new Promise((resolve, reject) => {
+        fs.mkdir(DATA_DIR, { recursive: true }, (dirErr) => {
+            if (dirErr) return reject(dirErr);
+            const tmpPath = `${filePath}.${process.pid}.tmp`;
+            fs.writeFile(tmpPath, JSON.stringify(data), (err) => {
+                if (err) return reject(err);
+                fs.rename(tmpPath, filePath, (renameErr) => renameErr ? reject(renameErr) : resolve());
+            });
+        });
+    }));
+    // Keep the queue itself always-resolving so one failed write doesn't
+    // block every write queued after it; the caller still gets the real
+    // rejection via the returned promise.
+    historyWriteQueue = result.catch(() => {});
+    return result;
+}
 
 const SABNZB_BASE_URL = process.env.SABNZB_BASE_URL && process.env.SABNZB_BASE_URL.trim();
 const SABNZB_API_KEY = process.env.SABNZB_API_KEY && process.env.SABNZB_API_KEY.trim();
@@ -23,7 +67,10 @@ const NZBGEEK_SEARCH_LIMIT = parseInt(process.env.NZBGEEK_SEARCH_LIMIT || '200',
 
 // Enable CORS for all routes
 app.use(cors());
-app.use(express.json());
+// The default 100kb body limit was silently rejecting the one-time history
+// migration (a long-lived download/ignore history that used to live in
+// localStorage can legitimately run several MB) with a 413 on every attempt.
+app.use(express.json({ limit: '50mb' }));
 
 // Serve static files
 app.use(express.static('.'));
@@ -178,13 +225,23 @@ app.get('/api/sabnzb/status', (req, res) => {
     res.json({ configured });
 });
 
-// Performer thumbnail lookup. Scrapes thumbnailseries.com's performer page for
-// up to 10 distinct gallery thumbnail URLs and hands them back to the client,
-// which hotlinks whichever one is chosen directly - we never download or
-// store the image ourselves, only the resolved URL strings (in-memory,
-// cleared on restart).
-const THUMBNAIL_SOURCE_BASE = 'https://www.thumbnailseries.com';
+// Performer thumbnail lookup. Hands the client up to 10 candidate photo URLs
+// for a name, which it hotlinks directly - we never download or store the
+// images ourselves, only the resolved URL strings (in-memory, cleared on
+// restart).
+//
+// Primary source is Babepedia's profile pictures (/pics/<Name>.jpg, then
+// <Name>2.jpg, <Name>3.jpg, ...): real headshot-style portraits, and the
+// image URLs are directly reachable even though its HTML pages sit behind a
+// bot check. Names there are case-sensitive Title Case, and an unknown name
+// 302s rather than 404ing. FreeOnes' search avatars (faces) and porn-star.com's
+// scene-gallery thumbnails are appended after, for names Babepedia lacks.
+const BABEPEDIA_PICS_BASE = 'https://www.babepedia.com/pics';
+const GALLERY_SOURCE_BASE = 'https://www.porn-star.com';
 const THUMBNAIL_OPTION_COUNT = 10;
+const THUMBNAIL_FETCH_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+};
 const performerThumbnailsCache = new Map(); // lowercased name -> array of image URLs
 
 function slugifyPerformerName(name) {
@@ -196,6 +253,88 @@ function slugifyPerformerName(name) {
         .replace(/^-+|-+$/g, '');
 }
 
+// "freya.parker" / "FREYA PARKER" -> "Freya Parker"
+function titleCasePerformerName(name) {
+    return name
+        .replace(/[._]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase()
+        .replace(/(^|[\s'-])([a-z])/g, (m, sep, ch) => sep + ch.toUpperCase());
+}
+
+async function urlIsImage(url) {
+    try {
+        const response = await fetch(url, { method: 'HEAD', headers: THUMBNAIL_FETCH_HEADERS, redirect: 'manual' });
+        return response.status === 200 && /^image\//i.test(response.headers.get('content-type') || '');
+    } catch (err) {
+        return false;
+    }
+}
+
+async function findBabepediaPhotos(name) {
+    const variants = [...new Set([titleCasePerformerName(name), name.replace(/[._]+/g, ' ').trim()])].filter(Boolean);
+    for (const variant of variants) {
+        const base = `${BABEPEDIA_PICS_BASE}/${encodeURIComponent(variant)}`;
+        if (!(await urlIsImage(`${base}.jpg`))) continue;
+        // Profile picture exists; the numbered extras are probed in parallel
+        const extraSuffixes = [2, 3, 4, 5, 6, 7, 8, 9];
+        const extras = await Promise.all(extraSuffixes.map(async n => (await urlIsImage(`${base}${n}.jpg`)) ? `${base}${n}.jpg` : null));
+        return [`${base}.jpg`, ...extras.filter(Boolean)];
+    }
+    return [];
+}
+
+async function findGalleryPhotos(name) {
+    const slug = slugifyPerformerName(name);
+    if (!slug) return [];
+    const pageUrl = `${GALLERY_SOURCE_BASE}/${slug}/`;
+    // An unknown performer 302s to the home page rather than 404ing, so
+    // redirects must not be followed or the home page's unrelated
+    // thumbnails would be returned as if they belonged to this name.
+    const response = await fetch(pageUrl, { headers: THUMBNAIL_FETCH_HEADERS, redirect: 'manual' });
+    if (response.status !== 200) return [];
+    const html = await response.text();
+    const matches = html.matchAll(/<img[^>]+class=["']thumbnail["'][^>]+src=["']([^"']+\.(?:jpg|jpeg|png|webp))["']/gi);
+    return [...matches].map(m => new URL(m[1], pageUrl).href);
+}
+
+const FREEONES_BASE = 'https://www.freeones.com';
+
+function normalizePerformerName(name) {
+    return name.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+// FreeOnes' performer search lists each match with a face avatar. Returns
+// {exact, near}: exact = same name, near = every word of the query is the
+// start of a word in the result's name (so "Kitty Wild" finds "Kitty Wilder"
+// but not the unrelated results its fuzzy search pads the list with).
+async function findFreeonesPhotos(name) {
+    const response = await fetch(`${FREEONES_BASE}/performers?q=${encodeURIComponent(name.replace(/[._]+/g, ' ').trim())}`, {
+        headers: THUMBNAIL_FETCH_HEADERS
+    });
+    if (!response.ok) return { exact: [], near: [] };
+    const html = await response.text();
+
+    const wanted = normalizePerformerName(name);
+    const wantedWords = wanted.split(' ').filter(Boolean);
+    const exact = [];
+    const near = [];
+    for (const block of html.split('data-test="teaser-subject"').slice(1)) {
+        const img = block.match(/<img[^>]*?src="(https:\/\/thumbs\.freeones\.com[^"]+)"[^>]*?alt="([^"]*)"/s);
+        if (!img) continue;
+        const url = img[1].replace(/&amp;/g, '&');
+        const resultName = normalizePerformerName(img[2].replace(/&#0?39;/g, "'").replace(/&amp;/g, '&'));
+        if (resultName === wanted) {
+            exact.push(url);
+        } else {
+            const resultWords = resultName.split(' ');
+            if (wantedWords.length > 0 && wantedWords.every(w => resultWords.some(r => r.startsWith(w)))) near.push(url);
+        }
+    }
+    return { exact, near: near.slice(0, 4) };
+}
+
 app.get('/api/performer-thumbnails', async (req, res) => {
     const name = req.query.name;
     if (!name || typeof name !== 'string' || !name.trim()) {
@@ -204,41 +343,29 @@ app.get('/api/performer-thumbnails', async (req, res) => {
 
     const cacheKey = name.trim().toLowerCase();
     if (performerThumbnailsCache.has(cacheKey)) {
-        return res.json({ imageUrls: performerThumbnailsCache.get(cacheKey) });
-    }
-
-    const slug = slugifyPerformerName(name);
-    if (!slug) {
-        return res.json({ imageUrls: [] });
+        return res.json(performerThumbnailsCache.get(cacheKey));
     }
 
     try {
-        const pageUrl = `${THUMBNAIL_SOURCE_BASE}/pornstars/${slug}/`;
-        const response = await fetch(pageUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; RSSParser/1.0)' }
-        });
+        const [faces, freeones, gallery] = await Promise.all([
+            findBabepediaPhotos(name),
+            findFreeonesPhotos(name).catch(() => ({ exact: [], near: [] })),
+            findGalleryPhotos(name).catch(() => [])
+        ]);
+        const exactUrls = [...new Set([...faces, ...freeones.exact, ...gallery])].slice(0, THUMBNAIL_OPTION_COUNT);
 
-        if (!response.ok) {
-            // A stable "no such performer page" result is worth caching;
-            // don't cache below on genuine network errors so those can retry
-            performerThumbnailsCache.set(cacheKey, []);
-            return res.json({ imageUrls: [] });
-        }
+        // Only when nothing matches the name exactly are close matches
+        // offered (flagged, so the client never auto-applies one as the
+        // performer's photo - a different person's face as a default would
+        // be worse than the placeholder).
+        const approximate = exactUrls.length === 0 && freeones.near.length > 0;
+        const imageUrls = approximate ? freeones.near : exactUrls;
 
-        const html = await response.text();
-        const matches = html.matchAll(/["'](\/tgpx\/thumbs\/[^"']+\.(?:jpg|jpeg|png|webp))["']/gi);
-        const seen = new Set();
-        const imageUrls = [];
-        for (const m of matches) {
-            const url = `${THUMBNAIL_SOURCE_BASE}${m[1]}`;
-            if (seen.has(url)) continue;
-            seen.add(url);
-            imageUrls.push(url);
-            if (imageUrls.length >= THUMBNAIL_OPTION_COUNT) break;
-        }
-
-        performerThumbnailsCache.set(cacheKey, imageUrls);
-        res.json({ imageUrls });
+        // Misses aren't cached: a failed probe can't be told apart from a
+        // transient network error, and a stuck empty result would hide
+        // photos until the next restart.
+        if (imageUrls.length > 0) performerThumbnailsCache.set(cacheKey, { imageUrls, approximate });
+        res.json({ imageUrls, approximate });
     } catch (err) {
         console.error('Performer thumbnail lookup error:', err.message);
         res.json({ imageUrls: [] });
@@ -349,8 +476,19 @@ app.post('/api/sabnzb/history/clear', async (req, res) => {
     }
 
     try {
-        // First try: delete all in one call (supported by most SABnzbd versions)
-        const deleteAllParams = { mode: 'history', name: 'delete', value: 'all' };
+        // SABnzbd's value=all only removes completed entries; failed ones need
+        // their own value=failed call. Best-effort: a failure here shouldn't
+        // block clearing the rest, and the 'all' call below reports real errors.
+        try {
+            await sabFetch({ mode: 'history', name: 'delete', value: 'failed', del_files: '1' });
+        } catch (e) {
+            console.error('SabNZB clear failed-history error:', e.message);
+        }
+
+        // First try: delete all in one call (supported by most SABnzbd versions).
+        // del_files=1 also removes the leftover files of failed/incomplete jobs -
+        // without it, a "cleared" failed job's partial download stays on disk.
+        const deleteAllParams = { mode: 'history', name: 'delete', value: 'all', del_files: '1' };
         const deleteAllRes = await sabFetch(deleteAllParams);
         const deleteAllData = await deleteAllRes.json().catch(() => ({}));
 
@@ -378,9 +516,10 @@ app.post('/api/sabnzb/history/clear', async (req, res) => {
             }
 
             const nzoIds = slots.map(s => s.nzo_id).filter(Boolean);
-            // Delete in one call with comma-separated ids (per wiki: value=NZO_ID_1,NZO_ID_2,NZO_ID_3)
+            // Delete in one call with comma-separated ids (per wiki: value=NZO_ID_1,NZO_ID_2,NZO_ID_3).
+            // del_files=1 so failed jobs' leftover partial files are removed too, not just the history entry.
             const value = nzoIds.join(',');
-            const deleteRes = await sabFetch({ mode: 'history', name: 'delete', value, archive: '0' });
+            const deleteRes = await sabFetch({ mode: 'history', name: 'delete', value, archive: '0', del_files: '1' });
             const deleteData = await deleteRes.json().catch(() => ({}));
 
             if (!deleteRes.ok || deleteData.status === false || deleteData.error) {
@@ -404,6 +543,92 @@ app.post('/api/sabnzb/history/clear', async (req, res) => {
     } catch (err) {
         console.error('SabNZB clear history error:', err.message);
         res.status(500).json({ ok: false, error: err.message || 'Failed to reach SabNZB' });
+    }
+});
+
+// Downloaded/ignored-file history (server-side, see comment near DATA_DIR above)
+app.get('/api/history', (req, res) => {
+    // Belt-and-braces: this must never be served stale from a cache — every
+    // page load's "is this already downloaded?" check depends on it.
+    res.set('Cache-Control', 'no-store');
+    res.json({
+        downloadedFiles: readJsonFile(DOWNLOADED_FILE),
+        ignoredFiles: readJsonFile(IGNORED_FILE)
+    });
+});
+
+app.post('/api/history/downloaded/upsert', async (req, res) => {
+    const { fileId, entry } = req.body || {};
+    if (!fileId || !entry || typeof entry !== 'object') {
+        return res.status(400).json({ ok: false, error: 'fileId and entry are required' });
+    }
+    try {
+        const data = readJsonFile(DOWNLOADED_FILE);
+        data[fileId] = entry;
+        await writeJsonFile(DOWNLOADED_FILE, data);
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('Error saving downloaded-file entry:', err.message);
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+app.post('/api/history/ignored/upsert', async (req, res) => {
+    const { fileId, entry } = req.body || {};
+    if (!fileId || !entry || typeof entry !== 'object') {
+        return res.status(400).json({ ok: false, error: 'fileId and entry are required' });
+    }
+    try {
+        const data = readJsonFile(IGNORED_FILE);
+        data[fileId] = entry;
+        await writeJsonFile(IGNORED_FILE, data);
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('Error saving ignored-file entry:', err.message);
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+app.post('/api/history/ignored/delete', async (req, res) => {
+    const { fileId } = req.body || {};
+    if (!fileId) return res.status(400).json({ ok: false, error: 'fileId is required' });
+    try {
+        const data = readJsonFile(IGNORED_FILE);
+        delete data[fileId];
+        await writeJsonFile(IGNORED_FILE, data);
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('Error deleting ignored-file entry:', err.message);
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+// One-time migration from a browser's localStorage (see script.js
+// migrateHistoryToServer): merges in whatever the server doesn't already
+// have, preferring the newer of the two timestamps when both sides have the
+// same fileId. Returns the merged store so the caller can adopt it directly.
+app.post('/api/history/import', async (req, res) => {
+    const { downloadedFiles, ignoredFiles } = req.body || {};
+    const mergeInto = (existing, incoming, dateField) => {
+        if (!incoming || typeof incoming !== 'object') return existing;
+        for (const [fileId, entry] of Object.entries(incoming)) {
+            if (!entry || typeof entry !== 'object') continue;
+            const current = existing[fileId];
+            if (!current || new Date(entry[dateField] || 0) >= new Date(current[dateField] || 0)) {
+                existing[fileId] = entry;
+            }
+        }
+        return existing;
+    };
+    try {
+        const mergedDownloaded = mergeInto(readJsonFile(DOWNLOADED_FILE), downloadedFiles, 'downloadedAt');
+        const mergedIgnored = mergeInto(readJsonFile(IGNORED_FILE), ignoredFiles, 'ignoredAt');
+        await writeJsonFile(DOWNLOADED_FILE, mergedDownloaded);
+        await writeJsonFile(IGNORED_FILE, mergedIgnored);
+        res.json({ ok: true, downloadedFiles: mergedDownloaded, ignoredFiles: mergedIgnored });
+    } catch (err) {
+        console.error('Error importing history:', err.message);
+        res.status(500).json({ ok: false, error: err.message });
     }
 });
 

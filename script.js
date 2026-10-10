@@ -21,8 +21,15 @@ class RSSParser {
         this.keywords = this.loadArray('rssParserKeywords');
         this.performers = this.loadArray('rssParserPerformers');
         this.excludeKeywords = this.loadArray('rssParserExcludeKeywords');
-        this.downloadedFiles = this.loadDownloadedFiles();
-        this.ignoredFiles = this.loadIgnoredFiles();
+        // Downloaded/ignored-file tracking is loaded from the server (see
+        // initHistoryFromServer) rather than localStorage, which has a small
+        // per-origin quota that this history silently outgrew. Callers that
+        // render or act on this data should await this.historyReady first;
+        // it's kicked off immediately so the round-trip is done long before
+        // a user can click Fetch.
+        this.downloadedFiles = {};
+        this.ignoredFiles = {};
+        this.historyReady = this.initHistoryFromServer();
         this.urlHistory = this.loadArray('rssParserUrlHistory');
         this.sabnzbConfigured = false;
         // Favorites/Performers tab sort mode (persisted); "custom" keeps the
@@ -64,6 +71,7 @@ class RSSParser {
         this.initializeTagListTools();
         this.initializeFavoritesTools();
         this.initializePerformersTools();
+        this.initializeFileDropSearch();
 
         // Display saved favorites and keywords
         setTimeout(() => {
@@ -168,61 +176,173 @@ class RSSParser {
         }
     }
 
-    loadDownloadedFiles() {
+    // Reads the OLD localStorage-based history, used only as a one-time
+    // migration source in initHistoryFromServer() — see the comment there.
+    loadLegacyLocalStorageMap(key) {
         try {
-            const saved = localStorage.getItem('rssParserDownloadedFiles');
+            const saved = localStorage.getItem(key);
             const parsed = saved ? JSON.parse(saved) : {};
             return typeof parsed === 'object' && parsed !== null ? parsed : {};
         } catch (error) {
-            console.error('Error loading downloaded files:', error);
+            console.error(`Error loading legacy ${key}:`, error);
             return {};
         }
     }
-    
-    saveDownloadedFiles() {
+
+    /**
+     * Loads downloaded/ignored-file history from the server. localStorage
+     * has a small, non-negotiable per-origin quota (~5-10MB) with no
+     * pruning in the old code, so this history silently stopped saving once
+     * it grew past that — the server file has no such ceiling.
+     *
+     * This is two independent steps, deliberately not one:
+     *  1. Load whatever the server currently has (retried a few times, and
+     *     loud on total failure — a single failed attempt here used to leave
+     *     the WHOLE session's history silently blank for the rest of the
+     *     tab's life, which is worse than the bug it replaced).
+     *  2. If there's still un-migrated legacy localStorage history, try to
+     *     merge it up to the server on top of what step 1 loaded.
+     * A migration payload can be several MB, so it's far more likely to fail
+     * (network hiccup, size limit, etc.) than the small "give me current
+     * state" request in step 1. If step 2 fails, it must never take down
+     * step 1's already-successfully-loaded, already-correct server data —
+     * that exact coupling is what caused every page load to show a blank
+     * history after a migration attempt started failing.
+     */
+    async initHistoryFromServer() {
+        await this.loadCurrentHistoryFromServer();
+        await this.migrateLegacyLocalStorageHistory();
+    }
+
+    async loadCurrentHistoryFromServer(attempt = 1) {
+        const MAX_ATTEMPTS = 4;
         try {
-            localStorage.setItem('rssParserDownloadedFiles', JSON.stringify(this.downloadedFiles));
+            const res = await fetch('/api/history');
+            if (!res.ok) throw new Error(`Server returned ${res.status} ${res.statusText}`);
+            const data = await res.json();
+            if (!data || typeof data.downloadedFiles !== 'object' || typeof data.ignoredFiles !== 'object') {
+                throw new Error('Unexpected response shape from /api/history');
+            }
+            this.downloadedFiles = data.downloadedFiles;
+            this.ignoredFiles = data.ignoredFiles;
         } catch (error) {
-            console.error('Error saving downloaded files:', error);
+            if (attempt < MAX_ATTEMPTS) {
+                console.warn(`History load from server failed (attempt ${attempt}/${MAX_ATTEMPTS}), retrying:`, error.message);
+                await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+                return this.loadCurrentHistoryFromServer(attempt + 1);
+            }
+            console.error(`Error loading history from server after ${MAX_ATTEMPTS} attempts:`, error);
+            this.historyLoadFailed = true;
+            alert(
+                "Couldn't load your download/ignore history from the server after several tries " +
+                `(${error.message}). Everything will show as unreviewed until this is fixed — ` +
+                'check that the app server is running and reachable, then reload the page. ' +
+                "Don't re-download things you've already downloaded until this is resolved."
+            );
         }
     }
-    
-    loadIgnoredFiles() {
+
+    async migrateLegacyLocalStorageHistory() {
+        if (localStorage.getItem('rssParserHistoryMigratedToServer') === '1') return;
+
+        const legacyDownloaded = this.loadLegacyLocalStorageMap('rssParserDownloadedFiles');
+        const legacyIgnored = this.loadLegacyLocalStorageMap('rssParserIgnoredFiles');
+        if (Object.keys(legacyDownloaded).length === 0 && Object.keys(legacyIgnored).length === 0) {
+            // Nothing to migrate (e.g. a browser that never used the old
+            // localStorage-based tracking) — nothing more to do, ever.
+            localStorage.setItem('rssParserHistoryMigratedToServer', '1');
+            return;
+        }
+
         try {
-            const saved = localStorage.getItem('rssParserIgnoredFiles');
-            const parsed = saved ? JSON.parse(saved) : {};
-            return typeof parsed === 'object' && parsed !== null ? parsed : {};
+            const res = await fetch('/api/history/import', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ downloadedFiles: legacyDownloaded, ignoredFiles: legacyIgnored })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.ok) throw new Error(data.error || res.statusText || 'Import failed');
+            if (!data.downloadedFiles || !data.ignoredFiles) throw new Error('Unexpected response shape from /api/history/import');
+            this.downloadedFiles = data.downloadedFiles;
+            this.ignoredFiles = data.ignoredFiles;
+            // Only clear the old copies once the server confirms it has
+            // them — a failed import above leaves localStorage untouched so
+            // the next page load can retry.
+            localStorage.removeItem('rssParserDownloadedFiles');
+            localStorage.removeItem('rssParserIgnoredFiles');
+            localStorage.setItem('rssParserHistoryMigratedToServer', '1');
+            console.log(`Migrated download history to the server: ${Object.keys(this.downloadedFiles).length} downloaded, ${Object.keys(this.ignoredFiles).length} ignored.`);
         } catch (error) {
-            console.error('Error loading ignored files:', error);
-            return {};
+            // Deliberately NOT rethrown and NOT touching this.downloadedFiles
+            // /this.ignoredFiles — whatever loadCurrentHistoryFromServer()
+            // already loaded from the server stays in effect. The legacy
+            // localStorage data (and the un-set migration flag) are left
+            // alone too, so the next page load just tries the migration
+            // again rather than losing the chance to ever recover it.
+            console.error('Error migrating legacy localStorage history to the server (will retry next page load):', error);
         }
     }
-    
-    saveIgnoredFiles() {
+
+    async persistDownloadedFile(fileId, entry) {
         try {
-            localStorage.setItem('rssParserIgnoredFiles', JSON.stringify(this.ignoredFiles));
+            const res = await fetch('/api/history/downloaded/upsert', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fileId, entry })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.ok) throw new Error(data.error || res.statusText || 'Save failed');
         } catch (error) {
-            console.error('Error saving ignored files:', error);
+            console.error('Error saving downloaded file to server:', error);
         }
     }
-    
+
+    async persistIgnoredFile(fileId, entry) {
+        try {
+            const res = await fetch('/api/history/ignored/upsert', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fileId, entry })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.ok) throw new Error(data.error || res.statusText || 'Save failed');
+        } catch (error) {
+            console.error('Error saving ignored file to server:', error);
+        }
+    }
+
+    async persistIgnoredFileRemoval(fileId) {
+        try {
+            const res = await fetch('/api/history/ignored/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fileId })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data.ok) throw new Error(data.error || res.statusText || 'Delete failed');
+        } catch (error) {
+            console.error('Error removing ignored file on server:', error);
+        }
+    }
+
     markFileAsIgnored(fileLink, fileName) {
         const fileId = this.getFileId(fileLink);
         const baseName = this.extractBaseName(fileName);
-        this.ignoredFiles[fileId] = {
+        const entry = {
             fileName: fileName,
             baseName: baseName,
             ignoredAt: new Date().toISOString()
         };
-        this.saveIgnoredFiles();
+        this.ignoredFiles[fileId] = entry;
+        this.persistIgnoredFile(fileId, entry);
         console.log('Marked file as ignored:', fileName, 'baseName:', baseName);
     }
-    
+
     unignoreFile(fileLink) {
         const fileId = this.getFileId(fileLink);
         if (this.ignoredFiles.hasOwnProperty(fileId)) {
             delete this.ignoredFiles[fileId];
-            this.saveIgnoredFiles();
+            this.persistIgnoredFileRemoval(fileId);
             console.log('Unignored file:', fileLink);
         }
     }
@@ -250,13 +370,14 @@ class RSSParser {
         // Use the file link as a unique identifier
         const fileId = this.getFileId(fileLink);
         const baseName = this.extractBaseName(fileName);
-        this.downloadedFiles[fileId] = {
+        const entry = {
             fileName: fileName,
             baseName: baseName,
             link: fileLink, // kept so a later "redownload recent files" can reissue the NZB
             downloadedAt: new Date().toISOString()
         };
-        this.saveDownloadedFiles();
+        this.downloadedFiles[fileId] = entry;
+        this.persistDownloadedFile(fileId, entry);
         console.log('Marked file as downloaded:', fileName, 'baseName:', baseName);
     }
     
@@ -384,6 +505,12 @@ class RSSParser {
         const redownloadBtn = document.getElementById('redownload-btn');
         if (redownloadBtn) {
             redownloadBtn.addEventListener('click', () => this.openRedownloadPicker(redownloadBtn));
+        }
+
+        // Download the preferred file from every brand in one go
+        const downloadAllBtn = document.getElementById('download-all-btn');
+        if (downloadAllBtn) {
+            downloadAllBtn.addEventListener('click', () => this.downloadAllPreferred(downloadAllBtn));
         }
         
         // Scroll to top button
@@ -966,7 +1093,8 @@ class RSSParser {
         };
     }
 
-    async fetchPerformerSearch(term) {
+    async fetchPerformerSearch(term, opts = {}) {
+        await this.historyReady;
         const input = document.getElementById('performer-search');
         // A term passed in (e.g. from a favourite/keyword chip) takes priority
         // over whatever is typed in the box.
@@ -997,7 +1125,7 @@ class RSSParser {
                 alert('No results found.');
             } else {
                 const saveTermEl = document.getElementById('save-search-term');
-                if (raw && (!saveTermEl || saveTermEl.checked)) {
+                if (opts.save !== false && raw && (!saveTermEl || saveTermEl.checked)) {
                     // Don't reclassify a term already tracked under another
                     // list (e.g. re-running a search from an existing Keyword
                     // chip) - and a favourite BRAND is never eligible either,
@@ -1033,6 +1161,353 @@ class RSSParser {
                 btn.textContent = 'Search';
             }
         }
+    }
+
+    /**
+     * Pull every performer's name out of an NZB-style filename, in filename
+     * order. Two passes: known names first (any saved performer whose words
+     * appear consecutively in the filename; where matches overlap - "Lily"
+     * saved alongside "Lily Lou" - the longer span wins), then the
+     * scene-release convention of Firstname.Lastname pairs chained with
+     * "And" directly after the YY.MM.DD date token
+     * (Brand.24.09.28.Freya.Parker.And.Lily.Lou.Title...). Returns [] rather
+     * than a low-confidence guess - the caller decides the fallback.
+     */
+    extractPerformersFromFilename(filename) {
+        if (!filename) return [];
+        let name = filename.replace(/\.[A-Za-z0-9]{2,4}$/, ''); // real file extension
+        name = name.replace(/-[A-Za-z0-9]{2,10}$/, ''); // trailing release-group tag
+        const words = name.split(/[\.\-_\s\[\]]+/).filter(Boolean);
+        const lowerWords = words.map(w => w.toLowerCase());
+
+        const spansOverlap = (a, b) => a.start < b.start + b.len && b.start < a.start + a.len;
+
+        const found = [];
+        for (const performer of this.performers) {
+            const pw = performer.toLowerCase().split(/\s+/).filter(Boolean);
+            if (pw.length === 0) continue;
+            for (let i = 0; i + pw.length <= lowerWords.length; i++) {
+                if (pw.every((w, j) => lowerWords[i + j] === w)) {
+                    found.push({ name: performer, start: i, len: pw.length });
+                    break;
+                }
+            }
+        }
+        // Longest span first, so "Lily Lou" claims its words before "Lily"
+        found.sort((a, b) => b.len - a.len || a.start - b.start);
+        const kept = [];
+        for (const m of found) {
+            if (!kept.some(k => spansOverlap(m, k))) kept.push(m);
+        }
+
+        const isNameWord = w => /^[A-Z][a-zA-Z'-]*$/.test(w) &&
+            !RSSParser.ALT_QUALITY_STRIP_TOKENS.has(w.toLowerCase());
+        const dateIdx = words.findIndex((w, i) =>
+            /^\d{2}$/.test(w) && /^\d{2}$/.test(words[i + 1] || '') && /^\d{2}$/.test(words[i + 2] || ''));
+        if (dateIdx !== -1) {
+            let i = dateIdx + 3;
+            while (i + 1 < words.length && isNameWord(words[i]) && isNameWord(words[i + 1]) &&
+                words[i + 1].toLowerCase() !== 'and') {
+                const candidate = { name: words[i] + ' ' + words[i + 1], start: i, len: 2 };
+                // A saved performer already claiming (part of) these words
+                // takes priority - its canonical spelling is better anyway
+                if (!kept.some(k => spansOverlap(candidate, k))) kept.push(candidate);
+                if ((words[i + 2] || '').toLowerCase() !== 'and') break;
+                i += 3;
+            }
+        }
+
+        kept.sort((a, b) => a.start - b.start);
+        const names = [];
+        for (const k of kept) {
+            if (!names.some(n => n.toLowerCase() === k.name.toLowerCase())) names.push(k.name);
+        }
+        return names;
+    }
+
+    /**
+     * Dialog listing the performers found in a filename, each with a
+     * photo, so the right one can be picked for the search. Resolves with
+     * the chosen name, or null if dismissed. Photos come from the saved
+     * thumbnail when the performer is already on the list, otherwise the
+     * first auto-found candidate; no photo at all gets an initial-letter
+     * placeholder.
+     */
+    async showPerformerChooser(names) {
+        const cards = await Promise.all(names.map(async name => {
+            const savedUrl = this.performerThumbnails[name.toLowerCase()];
+            if (savedUrl) return { name, url: savedUrl, approximate: false };
+            const { urls, approximate } = await this.fetchPerformerThumbnailCandidates(name);
+            return { name, url: urls[0] || null, approximate };
+        }));
+
+        return new Promise(resolve => {
+            const cardsHtml = cards.map(c => `
+                <button type="button" class="pch-card" data-name="${this.escapeHtml(c.name)}" title="Search ${this.escapeHtml(c.name)}">
+                    ${c.url
+                        ? `<img src="${this.escapeHtml(c.url)}" alt="${this.escapeHtml(c.name)}">`
+                        : `<span class="pch-placeholder">${this.escapeHtml(c.name.charAt(0))}</span>`}
+                    <span class="pch-name">${this.escapeHtml(c.name)}</span>
+                </button>
+            `).join('');
+            const anyApproximate = cards.some(c => c.approximate && c.url);
+
+            const overlay = document.createElement('div');
+            overlay.className = 'bdc-overlay';
+            overlay.innerHTML = `
+                <div class="bdc-dialog pch-dialog" role="dialog" aria-modal="true" aria-labelledby="pch-title">
+                    <h3 id="pch-title">Who do you want to search for?</h3>
+                    ${anyApproximate ? '<p class="ptp-approx">Some photos are close name matches only — they may not be the right person.</p>' : ''}
+                    <div class="pch-cards">${cardsHtml}</div>
+                    <div class="bdc-actions">
+                        <button type="button" class="bdc-cancel-btn">Cancel</button>
+                    </div>
+                </div>
+            `;
+
+            const close = (result) => {
+                document.removeEventListener('keydown', onKeydown);
+                overlay.remove();
+                resolve(result);
+            };
+            const onKeydown = (e) => {
+                if (e.key === 'Escape') close(null);
+            };
+            document.addEventListener('keydown', onKeydown);
+
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) return close(null);
+                const card = e.target.closest('.pch-card');
+                if (card) return close(card.dataset.name);
+                if (e.target.closest('.bdc-cancel-btn')) close(null);
+            });
+
+            document.body.appendChild(overlay);
+        });
+    }
+
+    /**
+     * /?performer=<filename> deep link (IINA color-tag plugin's ⌥P): pull
+     * the performers' names out of the playing file's name and run the
+     * main performer search. One name searches straight away; several
+     * bring up the photo chooser (showPerformerChooser) to pick who to
+     * search for. Only that chosen performer is added to the Performers
+     * list (with their thumbnail picker if new) - and only once the
+     * search has found results, so a misread name doesn't land in the
+     * list. Saving bypasses fetchPerformerSearch's own save path, whose
+     * checkbox/type dropdown govern manual searches.
+     */
+    async searchPerformerFromFilename(filename) {
+        const names = this.extractPerformersFromFilename(filename);
+        if (names.length > 0) {
+            const chosen = names.length === 1 ? names[0] : await this.showPerformerChooser(names);
+            if (!chosen) return; // chooser dismissed
+            await this.fetchPerformerSearch(chosen, { save: false });
+            if (this.brands.size > 0) await this.addPerformer(chosen);
+            return;
+        }
+        // No confident match: hand the cleaned title to the search box for
+        // a manual tweak instead of searching on a wrong guess.
+        const input = document.getElementById('performer-search');
+        if (input) {
+            input.value = this.deriveAltQualitySearchTerm(filename);
+            input.focus();
+        }
+        alert("Couldn't identify a performer in that filename — edit the search term and press Search.");
+    }
+
+    // Drag a file (e.g. one already downloaded) onto the app to search for
+    // the same content in another quality: an overlay lights up while a file
+    // is being dragged, and dropping it runs a search on its base name.
+    // Off by default - opt in via the "Actions" panel checkbox, since a
+    // window-wide drag listener isn't something every user wants active.
+    initializeFileDropSearch() {
+        const overlay = document.getElementById('file-drop-overlay');
+        const toggle = document.getElementById('enable-file-drop-search');
+        if (!overlay || !toggle) return;
+
+        this.fileDropSearchEnabled = localStorage.getItem('rssParserFileDropSearchEnabled') === '1';
+        toggle.checked = this.fileDropSearchEnabled;
+        toggle.addEventListener('change', () => {
+            this.fileDropSearchEnabled = toggle.checked;
+            localStorage.setItem('rssParserFileDropSearchEnabled', this.fileDropSearchEnabled ? '1' : '0');
+        });
+
+        let dragDepth = 0;
+        const isFileDrag = (e) => this.fileDropSearchEnabled && Array.from(e.dataTransfer?.types || []).includes('Files');
+
+        window.addEventListener('dragenter', (e) => {
+            if (!isFileDrag(e)) return;
+            e.preventDefault();
+            dragDepth++;
+            overlay.hidden = false;
+        });
+
+        window.addEventListener('dragover', (e) => {
+            if (!isFileDrag(e)) return;
+            e.preventDefault();
+        });
+
+        window.addEventListener('dragleave', (e) => {
+            if (!isFileDrag(e)) return;
+            dragDepth = Math.max(0, dragDepth - 1);
+            if (dragDepth === 0) overlay.hidden = true;
+        });
+
+        window.addEventListener('drop', (e) => {
+            if (!isFileDrag(e)) return;
+            e.preventDefault();
+            dragDepth = 0;
+            overlay.hidden = true;
+
+            const file = e.dataTransfer.files && e.dataTransfer.files[0];
+            if (!file) return;
+
+            this.searchAlternateQuality(file.name);
+        });
+    }
+
+    // Quality/format/codec tokens to strip when deriving an alternate-quality
+    // search term - these describe the file's format, not its content, and
+    // since we're deliberately searching for a DIFFERENT quality than the one
+    // dropped, the query must never include one (e.g. a dropped ...2160p.mp4
+    // must not search for "2160p").
+    static ALT_QUALITY_STRIP_TOKENS = new Set([
+        '2160p', '1080p', '720p', '480p', '360p', '4k', '8k',
+        'hdrip', 'brrip', 'bdrip', 'dvdrip', 'webrip', 'web-dl', 'webdl',
+        'hdtv', 'pdtv', 'sdtv',
+        'x264', 'x265', 'h264', 'h265', 'hevc', 'avc',
+        'aac', 'ac3', 'dts',
+        'xxx', 'mp4', 'mkv', 'avi', 'wmv', 'mov', 'nzb'
+    ]);
+
+    /**
+     * Turn a dropped file's name into a search query for its alternate-quality
+     * versions. Deliberately independent of extractBaseName()/the main search
+     * (fetchPerformerSearch) - this only needs to strip the real extension and
+     * any format/quality/release-group token, from anywhere in the name
+     * (not just when trailed by more text), so a quality tag sitting right
+     * before the extension is still removed.
+     */
+    deriveAltQualitySearchTerm(filename) {
+        if (!filename) return '';
+        let name = filename.replace(/\.[A-Za-z0-9]{2,4}$/, ''); // real file extension
+        name = name.replace(/-[A-Za-z0-9]{2,10}$/, ''); // trailing release-group tag, e.g. "-XC"
+        const words = name
+            .split(/[\.\-_\s]+/)
+            .filter(w => w && !RSSParser.ALT_QUALITY_STRIP_TOKENS.has(w.toLowerCase()));
+        return words.join(' ').trim();
+    }
+
+    /**
+     * Alternate-quality search: its own standalone search, independent of the
+     * main performer/keyword search. Deliberately does NOT apply exclude
+     * keywords and does NOT check/mark already-downloaded status - the point
+     * is to surface every other-quality candidate for the dropped file, not
+     * to hide ones that happen to match an exclude keyword or that a
+     * different-quality copy was already downloaded.
+     */
+    async searchAlternateQuality(filename) {
+        const searchTerm = this.deriveAltQualitySearchTerm(filename);
+        if (!searchTerm) {
+            alert("Couldn't derive a search term from that filename.");
+            return;
+        }
+
+        let items;
+        try {
+            const res = await fetch(`/api/search?q=${encodeURIComponent(searchTerm)}`);
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                throw new Error(data.error || data.message || res.statusText || 'Search failed');
+            }
+            items = (data && data.channel && data.channel.item) ? data.channel.item : (Array.isArray(data.item) ? data.item : []);
+        } catch (err) {
+            alert('Alternate quality search: ' + err.message);
+            return;
+        }
+
+        const files = (Array.isArray(items) ? items : [])
+            .map(item => this.extractFileInfoFromSearchItem(item))
+            .filter(Boolean);
+
+        if (files.length === 0) {
+            alert(`No alternate-quality results found for "${searchTerm}".`);
+            return;
+        }
+
+        files.sort((a, b) => b.pubDate - a.pubDate);
+        this.showAlternateQualityResults(files, searchTerm);
+    }
+
+    /**
+     * Results dialog for an alternate-quality search. Every row is fully
+     * actionable regardless of exclude-keyword or downloaded/ignored state -
+     * see searchAlternateQuality() for why.
+     */
+    showAlternateQualityResults(files, searchTerm) {
+        const rows = files.map(file => {
+            const correctedFilename = this.ensureFilenameHasXXX(file.name);
+            const proxyDownloadUrl = `/proxy/download?url=${encodeURIComponent(file.link)}&filename=${encodeURIComponent(correctedFilename)}`;
+            const sabnzbBtnHtml = this.sabnzbConfigured
+                ? `<button type="button" class="sabnzb-btn" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">Send to SabNZB</button>`
+                : '';
+            return `
+                <div class="file-item">
+                    <div class="file-info">
+                        <span class="file-name">${this.escapeHtml(file.name)}</span>
+                        <div class="file-meta">
+                            <span class="file-size">${this.escapeHtml(file.size)}</span>
+                            <span class="file-age">${this.escapeHtml(file.timeAgo)}</span>
+                        </div>
+                    </div>
+                    <div class="file-actions">
+                        ${sabnzbBtnHtml}
+                        <a href="${proxyDownloadUrl}" class="download-btn" data-file-link="${this.escapeHtml(file.link)}" data-file-name="${this.escapeHtml(file.name)}">Download NZB</a>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        const overlay = document.createElement('div');
+        overlay.className = 'bdc-overlay';
+        overlay.innerHTML = `
+            <div class="bdc-dialog aqr-dialog" role="dialog" aria-modal="true" aria-labelledby="aqr-title">
+                <h3 id="aqr-title">Alternate quality results</h3>
+                <p class="aqr-term">Searched for <strong>${this.escapeHtml(searchTerm)}</strong> - ${files.length} result${files.length !== 1 ? 's' : ''}</p>
+                <div class="aqr-list">${rows}</div>
+                <div class="bdc-actions">
+                    <button type="button" class="bdc-cancel-btn">Close</button>
+                </div>
+            </div>
+        `;
+
+        const close = () => {
+            document.removeEventListener('keydown', onKeydown);
+            overlay.remove();
+        };
+        const onKeydown = (e) => {
+            if (e.key === 'Escape') close();
+        };
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) close();
+        });
+        overlay.querySelector('.bdc-cancel-btn').addEventListener('click', close);
+        overlay.addEventListener('click', (e) => {
+            const target = e.target;
+            const fileLink = target.getAttribute && target.getAttribute('data-file-link');
+            const fileName = target.getAttribute && target.getAttribute('data-file-name');
+            if (!fileLink || !fileName) return;
+            if (target.classList.contains('download-btn')) {
+                this.handleDownloadClick(target, fileLink, fileName);
+            } else if (target.classList.contains('sabnzb-btn')) {
+                this.handleSabNZBClick(target, fileLink, fileName);
+            }
+        });
+        document.addEventListener('keydown', onKeydown);
+
+        document.body.appendChild(overlay);
     }
 
     async fetchSabNZBStatus() {
@@ -1165,9 +1640,64 @@ class RSSParser {
         selections.sort((a, b) => b.pubDate - a.pubDate);
 
         const via = this.sabnzbConfigured ? 'SabNZB' : 'browser download';
-        const chosen = await this.showBrandDownloadConfirm(brandName, selections, via);
+        const chosen = await this.showBrandDownloadConfirm(`Download ${brandName}`, selections, via);
         if (!chosen || chosen.length === 0) return;
 
+        await this.sendSelections(chosen, buttonElement);
+    }
+
+    /**
+     * Preferred-file selections across every brand currently in this.brands,
+     * respecting the same time/size filters as the results tab. Each
+     * selection is tagged with its brand name so the confirmation dialog and
+     * downstream bookkeeping can show/scope it correctly.
+     */
+    getPreferredFilesForAllBrands(cutoffTime = null) {
+        const selections = [];
+        const sortedBrands = Array.from(this.brands.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+        sortedBrands.forEach(([brandName, brandFiles]) => {
+            this.getPreferredFilesForBrand(brandFiles, cutoffTime).forEach(file => {
+                file._brandName = brandName;
+                selections.push(file);
+            });
+        });
+        return selections;
+    }
+
+    async downloadAllPreferred(buttonElement) {
+        if (this.brands.size === 0) {
+            alert('No RSS data loaded — fetch a feed first.');
+            return;
+        }
+
+        const cutoffTime = this.timeFilter > 0
+            ? new Date(Date.now() - (this.timeFilter * 60 * 60 * 1000))
+            : null;
+        const selections = this.getPreferredFilesForAllBrands(cutoffTime);
+
+        if (selections.length === 0) {
+            alert('Nothing to download — every group is already downloaded, ignored, or filtered out.');
+            return;
+        }
+
+        // Newest first, so a file-count limit keeps the most recent releases
+        selections.sort((a, b) => b.pubDate - a.pubDate);
+
+        const brandCount = new Set(selections.map(file => file._brandName)).size;
+        const via = this.sabnzbConfigured ? 'SabNZB' : 'browser download';
+        const heading = `Download All — ${brandCount} brand${brandCount !== 1 ? 's' : ''}`;
+        const chosen = await this.showBrandDownloadConfirm(heading, selections, via);
+        if (!chosen || chosen.length === 0) return;
+
+        await this.sendSelections(chosen, buttonElement);
+    }
+
+    /**
+     * Sends each selected file (via SabNZB if configured, otherwise a
+     * triggered browser download), marking it downloaded as it goes.
+     * Shared by the single-brand and download-all flows.
+     */
+    async sendSelections(chosen, buttonElement) {
         buttonElement.disabled = true;
         const originalText = buttonElement.textContent;
         let sent = 0;
@@ -1204,7 +1734,7 @@ class RSSParser {
      * total size, and a scrollable file list, with a limit control to download
      * only the newest N. Resolves with the chosen files, or null on cancel.
      */
-    showBrandDownloadConfirm(brandName, selections, via) {
+    showBrandDownloadConfirm(heading, selections, via) {
         return new Promise(resolve => {
             const summaryFor = (files) => {
                 let totalBytes = 0;
@@ -1223,7 +1753,7 @@ class RSSParser {
 
             const rows = selections.map((file, i) => `
                 <li class="bdc-file" data-index="${i}">
-                    <span class="bdc-file-name">${this.escapeHtml(file.name)}</span>
+                    <span class="bdc-file-name">${file._brandName ? `<span class="bdc-file-brand">${this.escapeHtml(file._brandName)}</span>` : ''}${this.escapeHtml(file.name)}</span>
                     <span class="bdc-file-size">${this.escapeHtml(file.size || '?')}</span>
                 </li>
             `).join('');
@@ -1240,7 +1770,7 @@ class RSSParser {
             overlay.className = 'bdc-overlay';
             overlay.innerHTML = `
                 <div class="bdc-dialog" role="dialog" aria-modal="true" aria-labelledby="bdc-title">
-                    <h3 id="bdc-title">Download ${this.escapeHtml(brandName)}</h3>
+                    <h3 id="bdc-title">${this.escapeHtml(heading)}</h3>
                     <div class="bdc-summary">
                         <div class="bdc-stat">
                             <span class="bdc-stat-value" id="bdc-count"></span>
@@ -1332,6 +1862,7 @@ class RSSParser {
     // recently downloaded files to reissue, then resends them the same way
     // (SabNZB or browser download) as a normal download.
     async openRedownloadPicker(buttonElement) {
+        await this.historyReady;
         const { entries, missingLinkCount } = this.getRedownloadableHistory();
 
         if (entries.length === 0) {
@@ -1494,6 +2025,7 @@ class RSSParser {
 
     async fetchRSS() {
         console.log('=== fetchRSS called ===');
+        await this.historyReady;
         const rssUrl = document.getElementById('rss-url').value.trim();
         console.log('RSS URL:', rssUrl);
         
@@ -2663,8 +3195,9 @@ class RSSParser {
             this.displayFavoritesAndKeywords();
             this.applyKeywordHighlighting();
             // New performer: offer a choice of thumbnails rather than silently
-            // picking whichever gallery still turns up first
-            this.selectPerformerThumbnail(name);
+            // picking whichever gallery still turns up first. Returned so
+            // callers adding several performers can await each picker in turn.
+            return this.selectPerformerThumbnail(name);
         }
     }
 
@@ -2679,7 +3212,10 @@ class RSSParser {
     }
 
     // Fetch up to 10 candidate thumbnail URLs for a performer, caching the
-    // result client-side for the session (server also caches across requests)
+    // result client-side for the session (server also caches across requests).
+    // `approximate` means no exact name match was found and these are close
+    // matches (e.g. "Kitty Wild" -> "Kitty Wilder") - fine to offer in the
+    // picker, never to apply automatically.
     async fetchPerformerThumbnailCandidates(name) {
         const key = name.toLowerCase();
         if (this.performerThumbnailCache.has(key)) {
@@ -2688,11 +3224,16 @@ class RSSParser {
         try {
             const res = await fetch(`/api/performer-thumbnails?name=${encodeURIComponent(name)}`);
             const data = await res.json().catch(() => ({}));
-            const urls = Array.isArray(data && data.imageUrls) ? data.imageUrls : [];
-            this.performerThumbnailCache.set(key, urls);
-            return urls;
+            const result = {
+                urls: Array.isArray(data && data.imageUrls) ? data.imageUrls : [],
+                approximate: !!(data && data.approximate)
+            };
+            // An empty result may be a transient lookup failure; don't pin it
+            // for the session
+            if (result.urls.length > 0) this.performerThumbnailCache.set(key, result);
+            return result;
         } catch (err) {
-            return [];
+            return { urls: [], approximate: false };
         }
     }
 
@@ -2700,8 +3241,8 @@ class RSSParser {
      * Resolve a performer's thumbnail and set it on the given <img>. A
      * persisted user pick (from selectPerformerThumbnail) always wins;
      * otherwise the first auto-fetched candidate is used as a default.
-     * Hotlinked directly from thumbnailseries.com (a third-party gallery
-     * aggregator, not a source of curated headshots) - leaves the placeholder
+     * Hotlinked directly from porn-star.com (a third-party performer
+     * gallery site, not a source of curated headshots) - leaves the placeholder
      * icon in place if nothing is found or the request fails.
      */
     async loadPerformerThumbnail(name, imgEl) {
@@ -2713,9 +3254,9 @@ class RSSParser {
             return;
         }
 
-        const urls = await this.fetchPerformerThumbnailCandidates(name);
+        const { urls, approximate } = await this.fetchPerformerThumbnailCandidates(name);
         // The tag list may have re-rendered while this was in flight
-        if (urls.length > 0 && imgEl.isConnected) this.applyPerformerThumbnail(imgEl, urls[0]);
+        if (urls.length > 0 && !approximate && imgEl.isConnected) this.applyPerformerThumbnail(imgEl, urls[0]);
     }
 
     applyPerformerThumbnail(imgEl, url) {
@@ -2731,8 +3272,8 @@ class RSSParser {
      * auto-fetched candidates) since uploading/pasting is always available.
      */
     async selectPerformerThumbnail(name) {
-        const urls = await this.fetchPerformerThumbnailCandidates(name);
-        const chosenUrl = await this.showThumbnailPicker(name, urls);
+        const { urls, approximate } = await this.fetchPerformerThumbnailCandidates(name);
+        const chosenUrl = await this.showThumbnailPicker(name, urls, approximate);
         if (!chosenUrl) return;
 
         this.performerThumbnails[name.toLowerCase()] = chosenUrl;
@@ -2779,7 +3320,7 @@ class RSSParser {
     // plus an upload-your-own and paste-a-URL fallback. Resolves with the
     // chosen URL (hotlink or a compressed data: URL), or null if closed
     // without picking.
-    showThumbnailPicker(name, urls) {
+    showThumbnailPicker(name, urls, approximate = false) {
         return new Promise(resolve => {
             const optionsHtml = urls.length > 0
                 ? urls.map((url, i) => `
@@ -2794,6 +3335,7 @@ class RSSParser {
             overlay.innerHTML = `
                 <div class="bdc-dialog ptp-dialog" role="dialog" aria-modal="true" aria-labelledby="ptp-title">
                     <h3 id="ptp-title">Choose a photo for ${this.escapeHtml(name)}</h3>
+                    ${approximate ? '<p class="ptp-approx">No exact match for that name — these are close matches, so check they are the right person.</p>' : ''}
                     <div class="ptp-options">${optionsHtml}</div>
                     <div class="ptp-custom">
                         <label class="ptp-upload-btn">
@@ -3032,6 +3574,56 @@ class RSSParser {
                 this.fetchPerformerSearch(el.getAttribute('data-term'));
             });
         });
+
+        container.querySelectorAll('.perf-chip').forEach(el => {
+            const name = el.getAttribute('data-term');
+            el.addEventListener('mouseenter', () => this.showPerformerHoverPopup(name, el));
+            el.addEventListener('mouseleave', () => this.hidePerformerHoverPopup());
+            el.addEventListener('click', () => this.hidePerformerHoverPopup());
+        });
+    }
+
+    // Floating photo preview shown while hovering a performer name in the
+    // Quick search panel. loadPerformerThumbnail skips detached images, so a
+    // slow lookup finishing after the pointer left is harmlessly dropped.
+    showPerformerHoverPopup(name, anchorEl) {
+        this.hidePerformerHoverPopup();
+
+        const popup = document.createElement('div');
+        popup.className = 'performer-hover-popup';
+        popup.innerHTML = `
+            <div class="performer-hover-photo">
+                <svg class="performer-thumb-placeholder" viewBox="0 0 24 24" aria-hidden="true">
+                    <circle cx="12" cy="8" r="4"></circle>
+                    <path d="M4 20c0-4.4 3.6-8 8-8s8 3.6 8 8"></path>
+                </svg>
+                <img class="performer-thumb" alt="">
+            </div>
+            <div class="performer-hover-name">${this.escapeHtml(name)}</div>
+        `;
+        document.body.appendChild(popup);
+        this._performerPopupEl = popup;
+
+        const rect = anchorEl.getBoundingClientRect();
+        const gap = 12;
+        const popupRect = popup.getBoundingClientRect();
+        let left = rect.right + gap;
+        if (left + popupRect.width > window.innerWidth - 8) {
+            left = Math.max(8, rect.left - gap - popupRect.width);
+        }
+        let top = rect.top + rect.height / 2 - popupRect.height / 2;
+        top = Math.min(Math.max(8, top), window.innerHeight - popupRect.height - 8);
+        popup.style.left = `${left}px`;
+        popup.style.top = `${top}px`;
+
+        this.loadPerformerThumbnail(name, popup.querySelector('.performer-thumb'));
+    }
+
+    hidePerformerHoverPopup() {
+        if (this._performerPopupEl) {
+            this._performerPopupEl.remove();
+            this._performerPopupEl = null;
+        }
     }
 
     // Wire the Quick-search collapse toggle once; restores the last open/closed
@@ -4001,14 +4593,18 @@ document.addEventListener('DOMContentLoaded', () => {
         window.rssParser = new RSSParser();
         console.log('RSSParser ready!');
 
-        // Deep link: /?altq=<filename> runs an alternate-quality search for
-        // that filename on load (used by the IINA color-tag plugin's hotkey
-        // to send the currently playing video here). The param is cleared
-        // from the URL so a reload doesn't re-run the search.
-        const altq = new URLSearchParams(window.location.search).get('altq');
-        if (altq) {
+        // Deep links (used by the IINA color-tag plugin's hotkeys to send
+        // the currently playing video's filename here):
+        //   /?altq=<filename>      alternate-quality search
+        //   /?performer=<filename> extract the performer's name and search it
+        // The param is cleared from the URL so a reload doesn't re-run it.
+        const deepLinkParams = new URLSearchParams(window.location.search);
+        const altq = deepLinkParams.get('altq');
+        const performerFile = deepLinkParams.get('performer');
+        if (altq || performerFile) {
             history.replaceState(null, '', window.location.pathname);
-            window.rssParser.searchAlternateQuality(altq);
+            if (altq) window.rssParser.searchAlternateQuality(altq);
+            if (performerFile) window.rssParser.searchPerformerFromFilename(performerFile);
         }
         
         // Test if elements exist

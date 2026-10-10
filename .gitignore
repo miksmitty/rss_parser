@@ -1,5 +1,6 @@
 .env
 logs/
+data/
 .playwright-mcp/
 .claude/settings.local.json
 .DS_Store
