@@ -4822,4 +4822,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 });
 
+// Close the RSS URL help popover when clicking elsewhere or pressing Escape
+document.addEventListener('click', (e) => {
+    const help = document.getElementById('url-help');
+    if (help && help.open && !help.contains(e.target)) help.open = false;
+});
+document.addEventListener('keydown', (e) => {
+    const help = document.getElementById('url-help');
+    if (e.key === 'Escape' && help && help.open) help.open = false;
+});
+
 console.log('RSS Parser script loaded');
