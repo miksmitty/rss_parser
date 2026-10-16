@@ -4,3 +4,5 @@ data/
 .playwright-mcp/
 .claude/settings.local.json
 .DS_Store
+node_modules/
+*.backup
